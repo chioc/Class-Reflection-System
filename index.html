@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Re:Point</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.1/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    .card { border-radius: 12px; border: none; margin-bottom: 1.5rem; }
+    .comment-box { border-radius: 8px; }
+    .nav-pills .nav-link.active { background-color: #0d6efd; }
+    .badge-cache { font-size: 0.75rem; vertical-align: middle; }
+    .btn-draft { background-color: #ffc107; color: #000; font-weight: bold; }
+
+    /* 💻 電子黒板・プロジェクター視認性強化用スタイル */
+    .plaza-card { border-left: 6px solid #20c997; background-color: #ffffff; }
+    .plaza-title { font-size: 1.25rem; font-weight: bold; color: #198754; }
+    .plaza-text { font-size: 1.05rem; line-height: 1.6; color: #212529; }
+    .plaza-subtext { font-size: 0.95rem; }
+  </style>
+</head>
+<body class="bg-light text-dark">
+  <div class="container py-4 px-3">
+    <h3 class="mb-4 text-center text-secondary">📍 Re:Point ログボード</h3>
+
+    <!-- ナビゲーションタブ（「クラスの広場」は全員共通で表示） -->
+    <ul class="nav nav-pills nav-fill mb-4 shadow-sm bg-white rounded-pill p-1" id="pills-tab" role="tablist">
+      <li class="nav-item">
+        <button class="nav-link active rounded-pill fw-bold" id="pills-individual-tab" data-bs-toggle="pill" data-bs-target="#pills-individual" type="button">個人の記録</button>
+      </li>
+      <li class="nav-item">
+        <button class="nav-link rounded-pill fw-bold" id="pills-plaza-tab" data-bs-toggle="pill" data-bs-target="#pills-plaza" type="button" onclick="initPlazaTab()">クラスの広場</button>
+      </li>
+      <? if (isTeacher) { ?>
+      <li class="nav-item">
+        <button class="nav-link rounded-pill fw-bold" id="pills-class-tab" data-bs-toggle="pill" data-bs-target="#pills-class" type="button" onclick="initClassTab()">クラス全体分析</button>
+      </li>
+      <? } ?>
+    </ul>
+
+    <!-- タブコンテンツ -->
+    <div class="tab-content" id="pills-tabContent">
+
+      <!-- 1. 個人の記録 -->
+      <div class="tab-pane fade show active" id="pills-individual" role="tabpanel">
+        <div id="individual-result">
+          <div class="d-flex justify-content-center mt-5"><div class="spinner-border text-primary"></div></div>
+        </div>
+      </div>
+
+      <!-- 2. クラスの広場 -->
+      <div class="tab-pane fade" id="pills-plaza" role="tabpanel">
+        <div class="card shadow-sm mb-4 border-0">
+          <div class="card-body bg-white rounded">
+            <div class="d-flex flex-wrap gap-2 align-items-center">
+              <label for="plazaDateSelect" class="form-label fw-bold mb-0 text-nowrap text-secondary">📅 日付：</label>
+              <select id="plazaDateSelect" class="form-select border-secondary-subtle" style="max-width: 200px;">
+                <option value="">読み込み中...</option>
+              </select>
+              <? if (isTeacher) { ?>
+              <!-- 教師のみ：クラス選択（生徒は自分のクラスが自動で選ばれる） -->
+              <label for="plazaClassSelect" class="form-label fw-bold mb-0 text-nowrap text-secondary">🏫 クラス：</label>
+              <select id="plazaClassSelect" class="form-select border-secondary-subtle" style="max-width: 140px;">
+                <? for (var i = 0; i < classList.length; i++) { ?>
+                <option value="<?= classList[i] ?>"><?= classList[i] === '桑の木' ? '桑の木' : classList[i] + '組' ?></option>
+                <? } ?>
+              </select>
+              <? } ?>
+              <button class="btn btn-success text-nowrap fw-bold shadow-sm" onclick="loadPlazaRecords()">みんなの記録を見る</button>
+            </div>
+          </div>
+        </div>
+        <div id="plaza-result">
+          <p class="text-center mt-5 text-muted">日付を選択して「みんなの記録を見る」を押してください。</p>
+        </div>
+      </div>
+
+      <!-- 3. 教師専用：クラス全体分析 -->
+      <? if (isTeacher) { ?>
+      <div class="tab-pane fade" id="pills-class" role="tabpanel">
+        <div class="card shadow-sm mb-4 border-0">
+          <div class="card-body bg-white rounded">
+            <div class="d-flex gap-2 align-items-center mb-3">
+              <label for="dateSelect" class="form-label fw-bold mb-0 text-nowrap text-secondary">📅 対象日：</label>
+              <select id="dateSelect" class="form-select border-secondary-subtle">
+                <option value="">読み込み中...</option>
+              </select>
+              <button class="btn btn-primary text-nowrap fw-bold shadow-sm" onclick="loadClassSummary()">分析を実行</button>
+            </div>
+            <div class="text-end">
+              <button class="btn btn-outline-danger btn-sm" onclick="handleBulkReEvaluate()">この日のAIコーチ回答を再生成</button>
+            </div>
+          </div>
+        </div>
+        <div id="class-result">
+          <p class="text-center mt-5 text-muted">日付を選択して「分析を実行」を押してください。</p>
+        </div>
+      </div>
+      <? } ?>
+    </div>
+  </div>
+
+  <script>
+    const IS_TEACHER = <?= isTeacher ?>;
+
+    window.addEventListener('DOMContentLoaded', loadIndividualRecords);
+
+    /** クラス番号 → 表示名 */
+    function classLabel(c) {
+      if (!c) return '';
+      return c === '桑の木' ? '桑の木' : c + '組';
+    }
+
+    /** AIコーチ欄の表示（生成状態に応じて切り替え） */
+    function coachText(r) {
+      if (r.status === '待機') return '<span class="text-muted">⏳ クラスのみんなの振り返りを読んでからコメントします（5分ほどで届きます）</span>';
+      if (r.status === 'エラー') return '<span class="text-muted">コメントを準備できませんでした。先生からのコメントを待ってね。</span>';
+      return r.aiCoach || '作成中...';
+    }
+
+    /** エラー表示 */
+    function showError(div, err) {
+      const msg = (err && err.message) ? err.message : 'エラーが発生しました。';
+      div.innerHTML = '<div class="alert alert-warning mt-4 text-center">' + msg + '</div>';
+    }
+
+    // 1. 個人の記録読み込み
+    function loadIndividualRecords() {
+      const div = document.getElementById('individual-result');
+      google.script.run
+        .withSuccessHandler(function(rows) {
+          if (!rows || rows.length === 0) {
+            div.innerHTML = '<p class="text-center text-muted mt-4">振り返りがまだありません。</p>';
+            return;
+          }
+          let html = '';
+          if (rows.some(r => r.status === '待機')) {
+            html += `<div class="text-end mb-3">
+                       <button class="btn btn-outline-primary btn-sm" onclick="loadIndividualRecords()">🔄 更新</button>
+                     </div>`;
+          }
+          rows.forEach(r => {
+            html += `
+              <div class="card shadow-sm mb-4">
+                <div class="card-body">
+                  <div class="d-flex justify-content-between align-items-center mb-3 text-muted small">
+                    <span>提出：${r.timestamp}</span><span class="badge bg-secondary">${classLabel(r.classNo)}</span>
+                  </div>
+                  <h5 class="card-title mb-3 border-bottom pb-2">${r.name || '生徒'} さんの記録</h5>
+                  <div class="mb-3 text-secondary small">
+                    <p class="mb-1"><strong>🎯 学習内容:</strong> ${r.learned}</p>
+                    <p class="mb-1"><strong>💡 分かった:</strong> ${r.understood}</p>
+                    <p class="mb-1"><strong>🤔 難しい:</strong> ${r.difficult}</p>
+                    <p class="mb-1"><strong>📝 自己評価:</strong> ${r.selfEval}</p>
+                  </div>
+                  <div class="comment-box p-3 mb-2 bg-info-subtle text-info-emphasis">
+                    <strong>🤖 AIコーチ</strong><br>${coachText(r)}
+                  </div>
+                  <div class="comment-box p-3 bg-success-subtle text-success-emphasis">
+                    <strong>👩‍🏫 先生</strong><br>${r.teacherComment || '未入力'}
+                  </div>
+                </div>
+              </div>`;
+          });
+          div.innerHTML = html;
+        })
+        .withFailureHandler(err => showError(div, err))
+        .getUserRecords();
+    }
+
+    // 2. クラスの広場（日付の初期化：生徒は自分の提出日のみ、教師は全日付）
+    function initPlazaTab() {
+      const sel = document.getElementById('plazaDateSelect');
+      sel.innerHTML = '<option value="">読み込み中...</option>';
+      google.script.run
+        .withSuccessHandler(dates => {
+          if (!dates || dates.length === 0) {
+            sel.innerHTML = '<option value="">データがありません</option>';
+            return;
+          }
+          sel.innerHTML = dates.map(d => `<option value="${d}">${d}</option>`).join('');
+        })
+        .withFailureHandler(() => {
+          sel.innerHTML = '<option value="">読み込みに失敗しました</option>';
+        })
+        .getPlazaAvailableDates();
+    }
+
+    // 2. クラスの広場（生徒：自分のクラスのみ／教師：選択したクラス）
+    function loadPlazaRecords() {
+      const date = document.getElementById('plazaDateSelect').value;
+      const div = document.getElementById('plaza-result');
+      if (!date) return;
+      const classNo = IS_TEACHER ? document.getElementById('plazaClassSelect').value : '';
+      div.innerHTML = '<div class="text-center mt-5"><div class="spinner-border text-success"></div></div>';
+
+      google.script.run
+        .withSuccessHandler(res => {
+          const records = res.records;
+          const title = `${res.date}　${classLabel(res.classNo)}`;
+          if (!records || records.length === 0) {
+            div.innerHTML = `<p class="text-center text-muted mt-4">${title} の記録はありません。</p>`;
+            return;
+          }
+          let html = `<h4 class="text-secondary mb-3 fw-bold">👥 ${title} のみんなの記録 (${records.length}名)</h4>`;
+          records.forEach(r => {
+            html += `
+              <div class="card shadow-sm mb-3 plaza-card">
+                <div class="card-body py-3">
+                  <h5 class="plaza-title mb-2">✨ ${r.name}</h5>
+                  <div class="plaza-text mb-3">
+                    <span class="badge bg-secondary me-1">🎯 内容</span> ${r.learned}<br>
+                    <span class="badge bg-success me-1">💡 分かった</span> <strong>${r.understood}</strong><br>
+                    <span class="badge bg-danger me-1">🤔 難しい</span> <span class="text-danger fw-bold">${r.difficult}</span>
+                  </div>
+                  <div class="row g-2 plaza-subtext">
+                    <div class="col-md-6">
+                      <div class="p-2 bg-light rounded text-muted border-start border-2 border-info">
+                        <strong>🤖 AIコーチ:</strong> ${r.aiCoach}
+                      </div>
+                    </div>
+                    <div class="col-md-6">
+                      <div class="p-2 bg-success-subtle text-success-emphasis rounded border-start border-2 border-success">
+                        <strong>👩‍🏫 先生:</strong> ${r.teacherComment}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>`;
+          });
+          div.innerHTML = html;
+        })
+        .withFailureHandler(err => showError(div, err))
+        .getClassReflectionsForStudents(date, classNo);
+    }
+
+    // 3. 教師専用：日付の初期化（全日付を表示）
+    function initClassTab() {
+      document.getElementById('dateSelect').innerHTML = '<option value="">読み込み中...</option>';
+      google.script.run.withSuccessHandler(dates => {
+        document.getElementById('dateSelect').innerHTML = dates.map(d => `<option value="${d}">${d}</option>`).join('');
+      }).getTeacherAvailableDates();
+    }
+
+    // 3. 教師専用：クラス分析表示
+    function loadClassSummary() {
+      const date = document.getElementById('dateSelect').value;
+      const div = document.getElementById('class-result');
+      div.innerHTML = '<div class="text-center mt-5"><div class="spinner-border text-primary"></div></div>';
+      google.script.run
+        .withSuccessHandler(res => {
+          if (!res) { div.innerHTML = 'データなし'; return; }
+          const cacheBadge = res.isCached ? '<span class="badge bg-light text-dark border badge-cache ms-2">保存済みデータから表示</span>' : '';
+          let listHtml = res.reflections.map(r => `<li class="list-group-item small">● ${r.understood}<br><span class="text-danger">▲ ${r.difficult}</span></li>`).join('');
+          div.innerHTML = `
+            <div class="card bg-primary text-white mb-4 shadow">
+              <div class="card-body">
+                <h5 class="card-title">🤖 AI分析 (${res.date})${cacheBadge}</h5>
+                <div class="bg-white text-dark p-3 rounded mt-2">${res.advice.replace(/\n/g, '<br>')}</div>
+                <div class="mt-3 text-end">
+                  <button class="btn btn-draft btn-sm shadow-sm" onclick="handleGenerateDrafts('${res.date}')">
+                    この日の「先生コメント素案」をO列に一括作成
+                  </button>
+                </div>
+              </div>
+            </div>
+            <div class="card shadow-sm">
+              <div class="card-body">
+                <h5 class="card-title">一覧 (${res.count}名)</h5>
+                <ul class="list-group list-group-flush border-top">${listHtml}</ul>
+              </div>
+            </div>`;
+        })
+        .withFailureHandler(err => showError(div, err))
+        .getClassSummary(date);
+    }
+
+    function handleGenerateDrafts(date) {
+      if (!confirm(date + " の全員に対し、スプレッドシートのO列に先生用コメントの案を作成します。よろしいですか？")) return;
+      const btn = event.target;
+      const originalText = btn.innerText;
+      btn.disabled = true; btn.innerText = "生成中...";
+
+      google.script.run
+        .withSuccessHandler(msg => {
+          alert(msg);
+          btn.disabled = false; btn.innerText = originalText;
+        })
+        .withFailureHandler(err => {
+          alert("エラー: " + err.message);
+          btn.disabled = false; btn.innerText = originalText;
+        })
+        .generateTeacherDraftsBulk(date);
+    }
+
+    function handleBulkReEvaluate() {
+      const date = document.getElementById('dateSelect').value;
+      if (!date) { alert('対象日を選択してください。'); return; }
+      if (!confirm(`${date} の全員のAIコーチ回答を再生成しますか？`)) return;
+      const btn = event.target;
+      const originalText = btn.innerText;
+      btn.disabled = true; btn.innerText = "処理中...";
+      google.script.run
+        .withSuccessHandler(msg => {
+          alert(msg); btn.disabled = false; btn.innerText = originalText;
+          loadIndividualRecords();
+        })
+        .withFailureHandler(err => {
+          alert("エラー: " + err.message); btn.disabled = false; btn.innerText = originalText;
+        })
+        .bulkReEvaluate(date);
+    }
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.1/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>
