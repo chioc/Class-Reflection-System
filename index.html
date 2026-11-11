@@ -137,8 +137,14 @@
 
   <script>
     const IS_TEACHER = <?= isTeacher ? 'true' : 'false' ?>;
+    // 【高速化】サーバーが最初の画面に埋め込んだ個人の記録（なければ null）
+    const INITIAL_RECORDS = <?!= initialRecordsJson ?>;
+    let myRecords = null;
 
-    window.addEventListener('DOMContentLoaded', loadIndividualRecords);
+    window.addEventListener('DOMContentLoaded', () => {
+      if (Array.isArray(INITIAL_RECORDS)) renderIndividualRecords(INITIAL_RECORDS);
+      else loadIndividualRecords();
+    });
 
     /**
      * 【セキュリティ】HTMLエスケープ
@@ -377,7 +383,14 @@
     function loadIndividualRecords() {
       const div = document.getElementById('individual-result');
       google.script.run
-        .withSuccessHandler(function(rows) {
+        .withSuccessHandler(renderIndividualRecords)
+        .withFailureHandler(err => showError(div, err))
+        .getUserRecords();
+    }
+
+    function renderIndividualRecords(rows) {
+          const div = document.getElementById('individual-result');
+          myRecords = rows || [];
           if (!rows || rows.length === 0) {
             div.innerHTML = '<p class="text-center text-muted mt-4">振り返りがまだありません。</p>';
             return;
@@ -408,14 +421,17 @@
               </div>`;
           });
           div.innerHTML = html;
-        })
-        .withFailureHandler(err => showError(div, err))
-        .getUserRecords();
     }
 
     // 2. クラスの広場（日付の初期化：生徒は自分の提出日のみ、教師は全日付）
     function initPlazaTab() {
       const sel = document.getElementById('plazaDateSelect');
+      // 【高速化】生徒の提出日は、読み込み済みの自分の記録から作る（サーバーに問い合わせない）
+      if (!IS_TEACHER && Array.isArray(myRecords)) {
+        const dates = [...new Set(myRecords.map(r => r.dateKey).filter(Boolean))].sort().reverse();
+        sel.innerHTML = dates.length ? dateOptions(dates) : '<option value="">データがありません</option>';
+        return;
+      }
       sel.innerHTML = '<option value="">読み込み中...</option>';
       google.script.run
         .withSuccessHandler(dates => {
