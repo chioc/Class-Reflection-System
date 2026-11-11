@@ -18,6 +18,13 @@
     .plaza-title { font-size: 1.25rem; font-weight: bold; color: #198754; }
     .plaza-text { font-size: 1.05rem; line-height: 1.6; color: #212529; }
     .plaza-subtext { font-size: 0.95rem; }
+
+    /* ✏️ 赤ペン確認 */
+    .reflection-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+    .red-underline { text-decoration: underline; text-decoration-color: #c62828; text-decoration-thickness: 3px; text-underline-offset: 4px; }
+    button.red-underline { border: 0; padding: 0; background: none; color: inherit; font: inherit; white-space: pre-wrap; text-align: left; }
+    .teacher-stamp { display: inline-block; color: #b71c1c; border: 3px solid #b71c1c; border-radius: 8px; padding: .4rem .7rem; font-weight: bold; }
+    .review-field { line-height: 2; user-select: text; -webkit-user-select: text; }
   </style>
 </head>
 <body class="bg-light text-dark">
@@ -33,6 +40,9 @@
         <button class="nav-link rounded-pill fw-bold" id="pills-plaza-tab" data-bs-toggle="pill" data-bs-target="#pills-plaza" type="button" onclick="initPlazaTab()">クラスの広場</button>
       </li>
       <? if (isTeacher) { ?>
+      <li class="nav-item">
+        <button class="nav-link rounded-pill fw-bold" id="pills-review-tab" data-bs-toggle="pill" data-bs-target="#pills-review" type="button" onclick="initReviewTab()">赤ペン確認</button>
+      </li>
       <li class="nav-item">
         <button class="nav-link rounded-pill fw-bold" id="pills-class-tab" data-bs-toggle="pill" data-bs-target="#pills-class" type="button" onclick="initClassTab()">クラス全体分析</button>
       </li>
@@ -76,7 +86,31 @@
         </div>
       </div>
 
-      <!-- 3. 教師専用：クラス全体分析 -->
+      <!-- 3. 教師専用：赤ペン確認 -->
+      <? if (isTeacher) { ?>
+      <div class="tab-pane fade" id="pills-review" role="tabpanel">
+        <div class="card shadow-sm"><div class="card-body">
+          <h4>赤ペン確認</h4>
+          <p class="text-secondary">大事な言葉を選択して赤線を引き、確認スタンプを押すと次の未確認の提出に進みます。</p>
+          <div class="d-flex flex-wrap gap-2 mb-3">
+            <label>日付<select id="review-date" class="form-select"><option value="">すべての日付</option></select></label>
+            <label>クラス<select id="review-class" class="form-select"><option value="">すべてのクラス</option>
+              <? for (var i = 0; i < classList.length; i++) { ?>
+              <option value="<?= classList[i] ?>"><?= classList[i] === '桑の木' ? '桑の木' : classList[i] + '組' ?></option>
+              <? } ?>
+            </select></label>
+            <button id="review-load" type="button" class="btn btn-outline-primary align-self-end" onclick="loadReviewQueue()">一覧を読み直す</button>
+          </div>
+          <p id="review-progress" role="status" aria-live="polite"></p>
+          <label for="review-picker" class="form-label">提出一覧（未確認から表示）</label>
+          <select id="review-picker" class="form-select mb-3" onchange="selectReviewRecord(this.value)"></select>
+          <div id="review-editor"></div>
+          <p id="review-message" role="status" aria-live="polite" class="mt-3"></p>
+        </div></div>
+      </div>
+      <? } ?>
+
+      <!-- 4. 教師専用：クラス全体分析 -->
       <? if (isTeacher) { ?>
       <div class="tab-pane fade" id="pills-class" role="tabpanel">
         <div class="card shadow-sm mb-4 border-0">
@@ -147,6 +181,198 @@
       div.innerHTML = '<div class="alert alert-warning mt-4 text-center">' + esc(msg) + '</div>';
     }
 
+    /* =====================================================================
+     *  赤ペン（表示：生徒・先生共通）
+     * ===================================================================== */
+
+    /** 本文を、赤線の位置に下線を付けて表示する（すべてエスケープ済み） */
+    function renderReviewText(value, field, review, editable = false) {
+      const text = String(value || '');
+      const spans = ((review && review.highlights) || []).map((h, index) => ({ ...h, index }))
+        .filter(h => h.field === field).sort((a, b) => a.start - b.start);
+      let html = '', cursor = 0;
+      spans.forEach(h => {
+        if (!Number.isInteger(h.start) || !Number.isInteger(h.end) ||
+            h.start < cursor || h.end > text.length || h.end <= h.start) return;
+        html += esc(text.slice(cursor, h.start));
+        const tag = editable ? 'button' : 'span';
+        const attrs = editable ? ` type="button" title="クリックして下線を取り消す" aria-label="下線を取り消す" onclick="removeReviewHighlight(${Number(h.index)})"` : '';
+        html += `<${tag} class="red-underline"${attrs}>${esc(text.slice(h.start, h.end))}</${tag}>`;
+        cursor = h.end;
+      });
+      return `<span class="reflection-text">${html + esc(text.slice(cursor))}</span>`;
+    }
+
+    /** 先生コメント（空なら何も出さない） */
+    function renderTeacherComment(comment) {
+      if (!String(comment || '').trim()) return '';
+      return `<div class="teacher-comment comment-box p-3 bg-success-subtle text-success-emphasis"><strong>👩‍🏫 先生</strong><br><span class="reflection-text">${esc(comment)}</span></div>`;
+    }
+
+    /** 確認スタンプ */
+    function renderTeacherStamp(review) {
+      if (!review || !review.stamped) return '';
+      const date = new Date(review.reviewedAt);
+      const label = Number.isNaN(date.getTime()) ? '' : date.toLocaleDateString('ja-JP', { timeZone: 'Asia/Tokyo' });
+      return `<div class="mb-2"><span class="teacher-stamp">確認しました</span> <small>${esc(label)}</small></div>`;
+    }
+
+    /* =====================================================================
+     *  赤ペン確認（教師専用タブ）
+     * ===================================================================== */
+
+    let reviewQueue = [], reviewIndex = -1, reviewHighlights = [], reviewComment = '', reviewDirty = false, reviewBusy = false;
+    let reviewInitialized = false;
+    const REVIEW_LABELS = { learned: '学習内容', understood: '分かったこと', difficult: '難しかったこと', selfEval: '自己評価' };
+    const REVIEW_FIELD_ORDER = Object.keys(REVIEW_LABELS);
+
+    function reviewMessage(message, error = false) {
+      const el = document.getElementById('review-message');
+      el.textContent = message;
+      el.className = error ? 'mt-3 text-danger' : 'mt-3 text-success';
+    }
+
+    function setReviewBusy(busy) {
+      reviewBusy = busy;
+      document.querySelectorAll('#pills-review button, #pills-review select, #pills-review textarea').forEach(el => { el.disabled = busy; });
+    }
+
+    function initReviewTab() {
+      if (reviewInitialized) return;
+      reviewInitialized = true;
+      google.script.run.withSuccessHandler(dates => {
+        const select = document.getElementById('review-date');
+        (dates || []).forEach(date => select.add(new Option(date, date)));
+      }).withFailureHandler(err => reviewMessage(err.message, true)).getTeacherAvailableDates();
+      loadReviewQueue();
+    }
+
+    function loadReviewQueue() {
+      if (reviewBusy || (reviewDirty && !confirm('保存していない変更を破棄して一覧を読み直しますか？'))) return;
+      setReviewBusy(true);
+      reviewMessage('読み込み中…');
+      google.script.run.withSuccessHandler(rows => {
+        reviewQueue = rows || [];
+        reviewDirty = false;
+        reviewIndex = reviewQueue.length ? 0 : -1;
+        setReviewBusy(false);
+        renderReviewEditor();
+        reviewMessage('');
+      }).withFailureHandler(err => { setReviewBusy(false); reviewMessage(err.message, true); })
+        .getTeacherReviewQueue(document.getElementById('review-date').value, document.getElementById('review-class').value);
+    }
+
+    function selectReviewRecord(value) {
+      if (reviewBusy) return;
+      if (reviewDirty && !confirm('保存していない変更を破棄して移動しますか？')) {
+        document.getElementById('review-picker').value = String(reviewIndex);
+        return;
+      }
+      reviewIndex = Number(value);
+      reviewDirty = false;
+      renderReviewEditor();
+      reviewMessage('');
+    }
+
+    function renderReviewEditor(keepHighlights = false) {
+      const remaining = reviewQueue.filter(r => !r.review.stamped).length;
+      document.getElementById('review-progress').textContent = `未確認 ${remaining}件 ／ 全${reviewQueue.length}件`;
+      const picker = document.getElementById('review-picker');
+      picker.innerHTML = reviewQueue.map((r, i) => `<option value="${i}">${r.review.stamped ? '確認済' : '未確認'}：${esc(r.date)} ${classLabel(r.classNo)} ${esc(r.name)}</option>`).join('');
+      picker.value = String(reviewIndex);
+      const editor = document.getElementById('review-editor');
+      const record = reviewQueue[reviewIndex];
+      if (!record) { editor.innerHTML = '<p>対象の提出はありません。</p>'; return; }
+      if (!keepHighlights) {
+        reviewHighlights = record.review.highlights.map(h => ({ ...h }));
+        reviewComment = record.teacherComment;
+      }
+      editor.innerHTML = `<h5>${esc(record.name)} さんの振り返り</h5>
+        ${renderTeacherStamp(record.review)}
+        <p class="small text-secondary">文章を選択して「赤線を引く」。下線部分を押すと取り消せます。コメントの入力・保存もできます。</p>
+        ${REVIEW_FIELD_ORDER.map(field => `<div class="mb-3"><strong>${esc(REVIEW_LABELS[field])}</strong><div class="review-field border rounded p-2" data-review-field="${field}">${renderReviewText(record.text[field], field, { highlights: reviewHighlights }, true)}</div></div>`).join('')}
+        <div class="mb-3">
+          <label for="review-comment" class="form-label">先生コメント（任意）</label>
+          <textarea id="review-comment" class="form-control" rows="3" maxlength="5000">${esc(reviewComment)}</textarea>
+        </div>
+        <div class="d-flex flex-wrap gap-2">
+          <button type="button" class="btn btn-outline-danger" id="review-add">赤線を引く</button>
+          <button type="button" class="btn btn-outline-secondary" onclick="saveCurrentReview(false)">下線・コメントを保存</button>
+          <button type="button" class="btn btn-danger" onclick="saveCurrentReview(true)">確認しました・次へ</button>
+        </div>`;
+      document.getElementById('review-comment').addEventListener('input', e => {
+        reviewComment = e.target.value;
+        reviewDirty = true;
+        reviewMessage('変更は未保存です。保存または確認スタンプを押してください。');
+      });
+      const addBtn = document.getElementById('review-add');
+      addBtn.addEventListener('mousedown', e => e.preventDefault());   // 押したときに選択範囲が消えないように
+      addBtn.addEventListener('click', addReviewHighlight);
+    }
+
+    function addReviewHighlight() {
+      if (reviewBusy) return;
+      const selection = window.getSelection();
+      if (!selection || !selection.rangeCount || selection.isCollapsed) { reviewMessage('下線を引く文章を選択してください。', true); return; }
+      const range = selection.getRangeAt(0);
+      const parent = range.startContainer.nodeType === Node.ELEMENT_NODE ? range.startContainer : range.startContainer.parentElement;
+      const fieldEl = parent && parent.closest('[data-review-field]');
+      if (!fieldEl || !document.getElementById('review-editor').contains(fieldEl) || !fieldEl.contains(range.endContainer)) {
+        reviewMessage('一つの欄の中で文章を選択してください。', true); return;
+      }
+      const before = document.createRange();
+      before.selectNodeContents(fieldEl);
+      before.setEnd(range.startContainer, range.startOffset);
+      const field = fieldEl.dataset.reviewField;
+      let start = before.toString().length, end = start + range.toString().length;
+      if (end <= start) return;
+      // 重なる・接する下線は1本にまとめる
+      const kept = [];
+      reviewHighlights.forEach(h => {
+        if (h.field === field && h.start <= end && h.end >= start) { start = Math.min(start, h.start); end = Math.max(end, h.end); }
+        else kept.push(h);
+      });
+      if (kept.length >= 100) { reviewMessage('下線は100箇所までです。', true); return; }
+      reviewHighlights = kept.concat([{ field, start, end }])
+        .sort((a, b) => REVIEW_FIELD_ORDER.indexOf(a.field) - REVIEW_FIELD_ORDER.indexOf(b.field) || a.start - b.start);
+      selection.removeAllRanges();
+      reviewDirty = true;
+      renderReviewEditor(true);
+      reviewMessage('下線は未保存です。保存または確認スタンプを押してください。');
+    }
+
+    function removeReviewHighlight(index) {
+      if (reviewBusy) return;
+      reviewHighlights.splice(index, 1);
+      reviewDirty = true;
+      renderReviewEditor(true);
+      reviewMessage('取り消しは未保存です。保存または確認スタンプを押してください。');
+    }
+
+    function saveCurrentReview(stampAndNext) {
+      const record = reviewQueue[reviewIndex];
+      if (reviewBusy || !record) return;
+      setReviewBusy(true);
+      reviewMessage('保存中…');
+      google.script.run.withSuccessHandler(saved => {
+        record.review = saved;
+        record.teacherComment = saved.teacherComment;
+        reviewDirty = false;
+        reviewQueue.sort((a, b) => Number(a.review.stamped) - Number(b.review.stamped));
+        const next = reviewQueue.findIndex(r => !r.review.stamped);
+        reviewIndex = stampAndNext && next !== -1 ? next : reviewQueue.indexOf(record);
+        setReviewBusy(false);
+        renderReviewEditor();
+        reviewMessage(stampAndNext ? (next === -1 ? '対象の提出をすべて確認しました。' : '確認スタンプを保存しました。次の未確認の提出です。') : '下線・コメントを保存しました。');
+      }).withFailureHandler(err => { setReviewBusy(false); reviewMessage(err.message, true); })
+        .saveTeacherReview(record.recordId, record.snapshot, reviewHighlights, stampAndNext || record.review.stamped,
+                           record.review.revision, reviewComment, record.teacherComment);
+    }
+
+    window.addEventListener('beforeunload', event => {
+      if (reviewDirty || reviewBusy) { event.preventDefault(); event.returnValue = ''; }
+    });
+
     // 1. 個人の記録読み込み
     function loadIndividualRecords() {
       const div = document.getElementById('individual-result');
@@ -156,12 +382,9 @@
             div.innerHTML = '<p class="text-center text-muted mt-4">振り返りがまだありません。</p>';
             return;
           }
-          let html = '';
-          if (rows.some(r => r.status === '待機')) {
-            html += `<div class="text-end mb-3">
-                       <button class="btn btn-outline-primary btn-sm" onclick="loadIndividualRecords()">🔄 更新</button>
-                     </div>`;
-          }
+          let html = `<div class="text-end mb-3">
+                        <button class="btn btn-outline-primary btn-sm" onclick="loadIndividualRecords()">🔄 更新</button>
+                      </div>`;
           rows.forEach(r => {
             html += `
               <div class="card shadow-sm mb-4">
@@ -171,17 +394,16 @@
                   </div>
                   <h5 class="card-title mb-3 border-bottom pb-2">${esc(r.name || '生徒')} さんの記録</h5>
                   <div class="mb-3 text-secondary small">
-                    <p class="mb-1"><strong>🎯 学習内容:</strong> ${escBr(r.learned)}</p>
-                    <p class="mb-1"><strong>💡 分かった:</strong> ${escBr(r.understood)}</p>
-                    <p class="mb-1"><strong>🤔 難しい:</strong> ${escBr(r.difficult)}</p>
-                    <p class="mb-1"><strong>📝 自己評価:</strong> ${esc(r.selfEval)}</p>
+                    <p class="mb-1"><strong>🎯 学習内容:</strong> ${renderReviewText(r.learned, 'learned', r.teacherReview)}</p>
+                    <p class="mb-1"><strong>💡 分かった:</strong> ${renderReviewText(r.understood, 'understood', r.teacherReview)}</p>
+                    <p class="mb-1"><strong>🤔 難しい:</strong> ${renderReviewText(r.difficult, 'difficult', r.teacherReview)}</p>
+                    <p class="mb-1"><strong>📝 自己評価:</strong> ${renderReviewText(r.selfEval, 'selfEval', r.teacherReview)}</p>
                   </div>
                   <div class="comment-box p-3 mb-2 bg-info-subtle text-info-emphasis">
                     <strong>🤖 AIコーチ</strong><br>${coachText(r)}
                   </div>
-                  <div class="comment-box p-3 bg-success-subtle text-success-emphasis">
-                    <strong>👩‍🏫 先生</strong><br>${escBr(r.teacherComment || '未入力')}
-                  </div>
+                  ${renderTeacherStamp(r.teacherReview)}
+                  ${renderTeacherComment(r.teacherComment)}
                 </div>
               </div>`;
           });
@@ -214,7 +436,8 @@
       const date = document.getElementById('plazaDateSelect').value;
       const div = document.getElementById('plaza-result');
       if (!date) return;
-      const classNo = IS_TEACHER ? document.getElementById('plazaClassSelect').value : '';
+      const classSelect = document.getElementById('plazaClassSelect');
+      const classNo = IS_TEACHER && classSelect ? classSelect.value : '';
       div.innerHTML = '<div class="text-center mt-5"><div class="spinner-border text-success"></div></div>';
 
       google.script.run
@@ -232,19 +455,14 @@
                 <div class="card-body py-3">
                   <h5 class="plaza-title mb-2">✨ ${esc(r.name)}</h5>
                   <div class="plaza-text mb-3">
-                    <span class="badge bg-secondary me-1">🎯 内容</span> ${escBr(r.learned)}<br>
-                    <span class="badge bg-success me-1">💡 分かった</span> <strong>${escBr(r.understood)}</strong><br>
-                    <span class="badge bg-danger me-1">🤔 難しい</span> <span class="text-danger fw-bold">${escBr(r.difficult)}</span>
+                    <span class="badge bg-secondary me-1">🎯 内容</span> ${renderReviewText(r.learned, 'learned', r.teacherReview)}<br>
+                    <span class="badge bg-success me-1">💡 分かった</span> <strong>${renderReviewText(r.understood, 'understood', r.teacherReview)}</strong><br>
+                    <span class="badge bg-danger me-1">🤔 難しい</span> <span class="text-danger fw-bold">${renderReviewText(r.difficult, 'difficult', r.teacherReview)}</span>
                   </div>
                   <div class="row g-2 plaza-subtext">
-                    <div class="col-md-6">
+                    <div class="col-12">
                       <div class="p-2 bg-light rounded text-muted border-start border-2 border-info">
                         <strong>🤖 AIコーチ:</strong> ${escBr(r.aiCoach)}
-                      </div>
-                    </div>
-                    <div class="col-md-6">
-                      <div class="p-2 bg-success-subtle text-success-emphasis rounded border-start border-2 border-success">
-                        <strong>👩‍🏫 先生:</strong> ${escBr(r.teacherComment)}
                       </div>
                     </div>
                   </div>
