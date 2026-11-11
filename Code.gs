@@ -625,6 +625,7 @@ function getUserRecords() {
   var target = getActiveEmail_();
   if (!isTeacherUser_()) assertVerifiedEmailForm_();
   var data = getAnswerData_();
+  var reviews = loadTeacherReviews_(getSpreadsheet_());
   var out = [];
 
   for (var i = 1; i < data.length; i++) {
@@ -645,7 +646,8 @@ function getUserRecords() {
       selfEval:       String(row[COL.SELF_EVAL]       || ''),
       aiCoach:        String(row[COL.AI_COACH]        || ''),
       status:         String(row[COL.GEN_STATUS]      || ''),
-      teacherComment: String(row[COL.TEACHER_COMMENT] || '')
+      teacherComment: String(row[COL.TEACHER_COMMENT] || ''),
+      teacherReview:  publicReview_(reviewForRow_(row, reviews))
     });
   }
   return out;
@@ -698,10 +700,8 @@ function shuffle_(arr) {
   return arr;
 }
 
-/** 広場に先生コメントを表示するか（スクリプトプロパティ PLAZA_SHOW_TEACHER_COMMENT が false なら非表示） */
-function plazaShowsTeacherComment_() {
-  return PropertiesService.getScriptProperties().getProperty('PLAZA_SHOW_TEACHER_COMMENT') !== 'false';
-}
+/** 広場に表示する欄（自己評価は広場に出さないため、その下線も返さない） */
+var PLAZA_REVIEW_FIELDS = ['learned', 'understood', 'difficult'];
 
 /** 広場に表示するAIコーチ欄の文言 */
 function plazaCoachText_(row) {
@@ -733,7 +733,7 @@ function getClassReflectionsForStudents(targetDate, classNo) {
     if (!targetClass) throw new Error('この日の広場は表示できません（自分が提出した日だけ見ることができます）。');
   }
 
-  var showTeacher = isTeacher || plazaShowsTeacherComment_();
+  var reviews = loadTeacherReviews_(getSpreadsheet_());
   var out = [];
   for (var i = 1; i < data.length; i++) {
     var row = data[i];
@@ -746,7 +746,13 @@ function getClassReflectionsForStudents(targetDate, classNo) {
       understood:     String(row[COL.UNDERSTOOD]      || '未入力'),
       difficult:      String(row[COL.DIFFICULT]       || '未入力'),
       aiCoach:        plazaCoachText_(row),
-      teacherComment: showTeacher ? String(row[COL.TEACHER_COMMENT] || '未入力') : '（先生のコメントは個人の記録で確認してね）'
+      // 広場では先生コメントは出さず、赤線の位置だけを共有する
+      // （提出ID・確認者・本文スナップショット・確認日時は返さない）
+      teacherReview: {
+        highlights: reviewForRow_(row, reviews).highlights.filter(function(h) {
+          return PLAZA_REVIEW_FIELDS.indexOf(h.field) !== -1;
+        })
+      }
     });
   }
 
@@ -1957,4 +1963,215 @@ function processPendingComments_(force) {
 function clearPendingFlag_(props, startedAt) {
   var f = props.getProperty('AI_PENDING');
   if (f && Number(f) <= startedAt) props.deleteProperty('AI_PENDING');
+}
+
+/* =====================================================================
+ *  教師の赤ペン確認
+ *  - 回答本文は変更せず、下線の位置と確認スタンプを「教師チェック」シートに保存する
+ *  - 下線は本文のUTF-16オフセット（ブラウザーのRangeと同じ単位）で保存する
+ *  - 回答本文が後から変わった場合は、古い下線・スタンプは表示しない（スナップショットで照合）
+ *  - 「教師チェック」シートは先生だけが見る前提（確認者のメールアドレスを含む）
+ * ===================================================================== */
+
+var SHEET_TEACHER_REVIEWS = '教師チェック';
+var REVIEW_FIELDS = ['learned', 'understood', 'difficult', 'selfEval'];
+var MAX_REVIEW_HIGHLIGHTS = 100;
+var MAX_TEACHER_COMMENT_CHARS = 5000;
+
+/** 赤ペンの対象になる本文 */
+function reviewText_(row) {
+  return {
+    learned:    String(row[COL.LEARNED]    || ''),
+    understood: String(row[COL.UNDERSTOOD] || ''),
+    difficult:  String(row[COL.DIFFICULT]  || ''),
+    selfEval:   String(row[COL.SELF_EVAL]  || '')
+  };
+}
+
+/** 提出ID（行番号に依存しないため、回答シートを並べ替えても同じ提出に紐づく） */
+function reviewRecordId_(row) {
+  var ts = row[COL.TIMESTAMP];
+  return JSON.stringify([
+    ts instanceof Date ? ts.toISOString() : String(ts),
+    String(row[COL.EMAIL] || '').trim().toLowerCase(),
+    normalizeClass_(row[COL.CLASS_NO]),
+    getNameByClass_(row)
+  ]);
+}
+
+/** 教師チェックを { 提出ID: { row, data } } の形で読み込む（シートがなければ空） */
+function loadTeacherReviews_(ss) {
+  var map = Object.create(null);
+  var sheet = ss.getSheetByName(SHEET_TEACHER_REVIEWS);
+  if (!sheet) return map;
+  var values = sheet.getDataRange().getValues();
+  for (var i = 1; i < values.length; i++) {
+    if (!values[i][0]) continue;
+    try {
+      map[String(values[i][0])] = { row: i + 1, data: JSON.parse(values[i][1]) };
+    } catch (e) {
+      // 1行の破損で生徒の画面全体が使えなくならないよう、その行だけ飛ばしてログに残す
+      console.error('[review] 教師チェックの保存データを読み取れません（行 ' + (i + 1) + '）：' + e.message);
+    }
+  }
+  return map;
+}
+
+/** 行に対応する赤ペンの状態（本文が保存時から変わっていれば無効） */
+function reviewForRow_(row, reviews) {
+  var entry = reviews[reviewRecordId_(row)];
+  var saved = entry ? entry.data : null;
+  var same = !!(saved && saved.snapshot === JSON.stringify(reviewText_(row)));
+  return {
+    highlights: same && Array.isArray(saved.highlights) ? saved.highlights : [],
+    stamped:    Boolean(same && saved.stamped),
+    reviewedAt: same ? String(saved.reviewedAt || '') : '',
+    revision:   saved ? Number(saved.revision) || 0 : 0
+  };
+}
+
+/** 生徒に返す形（更新番号など先生用の情報は除く） */
+function publicReview_(r) {
+  return { highlights: r.highlights, stamped: r.stamped, reviewedAt: r.reviewedAt };
+}
+
+/** 【教師専用】赤ペン確認の一覧。未確認→確認済みの順、各グループ内は提出順 */
+function getTeacherReviewQueue(targetDate, classNo) {
+  if (!isTeacherUser_()) throw new Error('権限がありません。');
+  if (targetDate && !isValidDateKey_(targetDate)) throw new Error('日付の指定が正しくありません。');
+  var targetClass = normalizeClass_(classNo);
+  if (targetClass && CLASS_LIST.indexOf(targetClass) === -1) throw new Error('クラスを選択してください。');
+
+  var ss = getSpreadsheet_();
+  var data = getAnswerData_();
+  var reviews = loadTeacherReviews_(ss);
+  var out = [];
+  for (var i = 1; i < data.length; i++) {
+    var row = data[i];
+    if (!row[COL.TIMESTAMP] || !row[COL.EMAIL]) continue;
+    var dateKey = toDateKey_(row[COL.TIMESTAMP]);
+    var cls = rowClass_(row);
+    if (targetDate && dateKey !== targetDate) continue;
+    if (targetClass && cls !== targetClass) continue;
+    var text = reviewText_(row);
+    out.push({
+      recordId: reviewRecordId_(row),
+      snapshot: JSON.stringify(text),
+      date: dateKey,
+      classNo: cls,
+      name: getNameByClass_(row),
+      text: text,
+      teacherComment: String(row[COL.TEACHER_COMMENT] || ''),
+      review: reviewForRow_(row, reviews)
+    });
+  }
+  // Array.prototype.sort は安定ソートなので、同じグループ内は提出順のまま
+  out.sort(function(a, b) { return Number(a.review.stamped) - Number(b.review.stamped); });
+  return out;
+}
+
+/** ブラウザーから届いた下線の範囲を検証して、必要な項目だけに整える */
+function validateReviewHighlights_(highlights, text) {
+  if (!Array.isArray(highlights) || highlights.length > MAX_REVIEW_HIGHLIGHTS) {
+    throw new Error('下線は' + MAX_REVIEW_HIGHLIGHTS + '箇所までです。');
+  }
+  var clean = highlights.map(function(h) {
+    if (!h || REVIEW_FIELDS.indexOf(h.field) === -1 ||
+        !Number.isInteger(h.start) || !Number.isInteger(h.end) ||
+        h.start < 0 || h.end <= h.start || h.end > text[h.field].length) {
+      throw new Error('下線の範囲が正しくありません。');
+    }
+    return { field: h.field, start: h.start, end: h.end };
+  });
+  clean.sort(function(a, b) {
+    return REVIEW_FIELDS.indexOf(a.field) - REVIEW_FIELDS.indexOf(b.field) || a.start - b.start;
+  });
+  for (var i = 1; i < clean.length; i++) {
+    if (clean[i].field === clean[i - 1].field && clean[i].start < clean[i - 1].end) {
+      throw new Error('下線が重なっています。');
+    }
+  }
+  return clean;
+}
+
+/**
+ * 【教師専用】下線・確認スタンプ・先生コメントを保存する
+ *  - expectedRevision / expectedComment で、別の画面での更新を上書きしないようにする
+ *  - teacherComment が undefined のときは先生コメントを変更しない
+ */
+function saveTeacherReview(recordId, snapshot, highlights, stamp, expectedRevision, teacherComment, expectedComment) {
+  if (!isTeacherUser_()) throw new Error('権限がありません。');
+  if (typeof recordId !== 'string' || typeof snapshot !== 'string') throw new Error('提出の指定が正しくありません。');
+  if (typeof stamp !== 'boolean') throw new Error('確認状態が正しくありません。');
+  if (!Number.isInteger(expectedRevision) || expectedRevision < 0) throw new Error('更新番号が正しくありません。');
+
+  var lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    var ss = getSpreadsheet_();
+    var answerSheet = ss.getSheetByName(SHEET_ANSWERS);
+    var data = answerSheet.getDataRange().getValues();
+
+    var rowIndex = -1;
+    for (var i = 1; i < data.length; i++) {
+      if (reviewRecordId_(data[i]) !== recordId) continue;
+      if (rowIndex !== -1) throw new Error('提出を一意に特定できません。一覧を読み直してください。');
+      rowIndex = i;
+    }
+    if (rowIndex === -1) throw new Error('提出が見つかりません。一覧を読み直してください。');
+    var row = data[rowIndex];
+
+    var text = reviewText_(row);
+    if (JSON.stringify(text) !== snapshot) throw new Error('回答が変更されています。一覧を読み直してください。');
+
+    var currentComment = String(row[COL.TEACHER_COMMENT] || '');
+    var updateComment = (teacherComment !== undefined && teacherComment !== null);
+    if (updateComment) {
+      if (typeof teacherComment !== 'string' || teacherComment.length > MAX_TEACHER_COMMENT_CHARS) {
+        throw new Error('先生コメントは' + MAX_TEACHER_COMMENT_CHARS + '文字以内で入力してください。');
+      }
+      if (expectedComment !== currentComment) throw new Error('先生コメントが別の画面で更新されています。一覧を読み直してください。');
+    }
+
+    var clean = validateReviewHighlights_(highlights, text);
+    var reviews = loadTeacherReviews_(ss);
+    var entry = reviews[recordId];
+    var revision = entry ? Number(entry.data.revision) || 0 : 0;
+    if (revision !== expectedRevision) throw new Error('別の画面で更新されています。一覧を読み直してください。');
+
+    var saved = {
+      snapshot: snapshot,
+      highlights: clean,
+      stamped: stamp,
+      reviewedAt: stamp ? new Date().toISOString() : '',
+      reviewer: getActiveEmail_(),
+      revision: revision + 1
+    };
+
+    var sheet = ss.getSheetByName(SHEET_TEACHER_REVIEWS);
+    if (!sheet) {
+      sheet = ss.insertSheet(SHEET_TEACHER_REVIEWS);
+      sheet.getRange(1, 1, 1, 2).setValues([['提出ID', '教師チェックJSON']]).setFontWeight('bold');
+      sheet.setFrozenRows(1);
+    }
+    // 提出IDは「[」、JSONは「{」で始まるため数式にはならないが、念のため safeCell_ を通す
+    sheet.getRange(entry ? entry.row : sheet.getLastRow() + 1, 1, 1, 2)
+      .setValues(safeValues_([[recordId, JSON.stringify(saved)]]));
+
+    if (updateComment) {
+      // リッチテキストとして保存し、先頭が「=」でも数式として実行しない
+      var cell = answerSheet.getRange(rowIndex + 1, colNo_(COL.TEACHER_COMMENT));
+      if (teacherComment) cell.setRichTextValue(SpreadsheetApp.newRichTextValue().setText(teacherComment).build());
+      else cell.clearContent();
+    }
+    SpreadsheetApp.flush();
+
+    var one = Object.create(null);
+    one[recordId] = { data: saved };
+    var result = reviewForRow_(row, one);
+    result.teacherComment = updateComment ? teacherComment : currentComment;
+    return result;
+  } finally {
+    lock.releaseLock();
+  }
 }
