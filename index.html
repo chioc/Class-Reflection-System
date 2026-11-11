@@ -88,7 +88,7 @@
               <button class="btn btn-primary text-nowrap fw-bold shadow-sm" onclick="loadClassSummary()">分析を実行</button>
             </div>
             <div class="text-end">
-              <button class="btn btn-outline-danger btn-sm" onclick="handleBulkReEvaluate()">この日のAIコーチ回答を再生成</button>
+              <button class="btn btn-outline-danger btn-sm" onclick="handleBulkReEvaluate(this)">この日のAIコーチ回答を再生成</button>
             </div>
           </div>
         </div>
@@ -101,27 +101,49 @@
   </div>
 
   <script>
-    const IS_TEACHER = <?= isTeacher ?>;
+    const IS_TEACHER = <?= isTeacher ? 'true' : 'false' ?>;
 
     window.addEventListener('DOMContentLoaded', loadIndividualRecords);
 
-    /** クラス番号 → 表示名 */
-    function classLabel(c) {
-      if (!c) return '';
-      return c === '桑の木' ? '桑の木' : c + '組';
+    /**
+     * 【セキュリティ】HTMLエスケープ
+     * 生徒の入力・AIの出力・先生コメント・サーバーからのメッセージなど、
+     * 画面に表示する文字列は必ずこの関数を通してから innerHTML に入れる。
+     * （<script> や onerror= などを書き込まれても、ただの文字として表示される）
+     */
+    function esc(s) {
+      return String(s === null || s === undefined ? '' : s).replace(/[&<>"'`]/g, c => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;', '`': '&#96;'
+      }[c]));
     }
 
-    /** AIコーチ欄の表示（生成状態に応じて切り替え） */
+    /** エスケープしたうえで改行を <br> にする（複数行の文章用） */
+    function escBr(s) {
+      return esc(s).replace(/\r?\n/g, '<br>');
+    }
+
+    /** クラス番号 → 表示名（エスケープ済み） */
+    function classLabel(c) {
+      if (!c) return '';
+      return esc(c === '桑の木' ? '桑の木' : c + '組');
+    }
+
+    /** AIコーチ欄の表示（生成状態に応じて切り替え・エスケープ済み） */
     function coachText(r) {
       if (r.status === '待機') return '<span class="text-muted">⏳ クラスのみんなの振り返りを読んでからコメントします（5分ほどで届きます）</span>';
       if (r.status === 'エラー') return '<span class="text-muted">コメントを準備できませんでした。先生からのコメントを待ってね。</span>';
-      return r.aiCoach || '作成中...';
+      return escBr(r.aiCoach || '作成中...');
+    }
+
+    /** 日付の <option> 一覧を作る（エスケープ済み） */
+    function dateOptions(dates) {
+      return dates.map(d => `<option value="${esc(d)}">${esc(d)}</option>`).join('');
     }
 
     /** エラー表示 */
     function showError(div, err) {
       const msg = (err && err.message) ? err.message : 'エラーが発生しました。';
-      div.innerHTML = '<div class="alert alert-warning mt-4 text-center">' + msg + '</div>';
+      div.innerHTML = '<div class="alert alert-warning mt-4 text-center">' + esc(msg) + '</div>';
     }
 
     // 1. 個人の記録読み込み
@@ -144,20 +166,20 @@
               <div class="card shadow-sm mb-4">
                 <div class="card-body">
                   <div class="d-flex justify-content-between align-items-center mb-3 text-muted small">
-                    <span>提出：${r.timestamp}</span><span class="badge bg-secondary">${classLabel(r.classNo)}</span>
+                    <span>提出：${esc(r.timestamp)}</span><span class="badge bg-secondary">${classLabel(r.classNo)}</span>
                   </div>
-                  <h5 class="card-title mb-3 border-bottom pb-2">${r.name || '生徒'} さんの記録</h5>
+                  <h5 class="card-title mb-3 border-bottom pb-2">${esc(r.name || '生徒')} さんの記録</h5>
                   <div class="mb-3 text-secondary small">
-                    <p class="mb-1"><strong>🎯 学習内容:</strong> ${r.learned}</p>
-                    <p class="mb-1"><strong>💡 分かった:</strong> ${r.understood}</p>
-                    <p class="mb-1"><strong>🤔 難しい:</strong> ${r.difficult}</p>
-                    <p class="mb-1"><strong>📝 自己評価:</strong> ${r.selfEval}</p>
+                    <p class="mb-1"><strong>🎯 学習内容:</strong> ${escBr(r.learned)}</p>
+                    <p class="mb-1"><strong>💡 分かった:</strong> ${escBr(r.understood)}</p>
+                    <p class="mb-1"><strong>🤔 難しい:</strong> ${escBr(r.difficult)}</p>
+                    <p class="mb-1"><strong>📝 自己評価:</strong> ${esc(r.selfEval)}</p>
                   </div>
                   <div class="comment-box p-3 mb-2 bg-info-subtle text-info-emphasis">
                     <strong>🤖 AIコーチ</strong><br>${coachText(r)}
                   </div>
                   <div class="comment-box p-3 bg-success-subtle text-success-emphasis">
-                    <strong>👩‍🏫 先生</strong><br>${r.teacherComment || '未入力'}
+                    <strong>👩‍🏫 先生</strong><br>${escBr(r.teacherComment || '未入力')}
                   </div>
                 </div>
               </div>`;
@@ -178,7 +200,7 @@
             sel.innerHTML = '<option value="">データがありません</option>';
             return;
           }
-          sel.innerHTML = dates.map(d => `<option value="${d}">${d}</option>`).join('');
+          sel.innerHTML = dateOptions(dates);
         })
         .withFailureHandler(() => {
           sel.innerHTML = '<option value="">読み込みに失敗しました</option>';
@@ -197,7 +219,7 @@
       google.script.run
         .withSuccessHandler(res => {
           const records = res.records;
-          const title = `${res.date}　${classLabel(res.classNo)}`;
+          const title = `${esc(res.date)}　${classLabel(res.classNo)}`;
           if (!records || records.length === 0) {
             div.innerHTML = `<p class="text-center text-muted mt-4">${title} の記録はありません。</p>`;
             return;
@@ -207,21 +229,21 @@
             html += `
               <div class="card shadow-sm mb-3 plaza-card">
                 <div class="card-body py-3">
-                  <h5 class="plaza-title mb-2">✨ ${r.name}</h5>
+                  <h5 class="plaza-title mb-2">✨ ${esc(r.name)}</h5>
                   <div class="plaza-text mb-3">
-                    <span class="badge bg-secondary me-1">🎯 内容</span> ${r.learned}<br>
-                    <span class="badge bg-success me-1">💡 分かった</span> <strong>${r.understood}</strong><br>
-                    <span class="badge bg-danger me-1">🤔 難しい</span> <span class="text-danger fw-bold">${r.difficult}</span>
+                    <span class="badge bg-secondary me-1">🎯 内容</span> ${escBr(r.learned)}<br>
+                    <span class="badge bg-success me-1">💡 分かった</span> <strong>${escBr(r.understood)}</strong><br>
+                    <span class="badge bg-danger me-1">🤔 難しい</span> <span class="text-danger fw-bold">${escBr(r.difficult)}</span>
                   </div>
                   <div class="row g-2 plaza-subtext">
                     <div class="col-md-6">
                       <div class="p-2 bg-light rounded text-muted border-start border-2 border-info">
-                        <strong>🤖 AIコーチ:</strong> ${r.aiCoach}
+                        <strong>🤖 AIコーチ:</strong> ${escBr(r.aiCoach)}
                       </div>
                     </div>
                     <div class="col-md-6">
                       <div class="p-2 bg-success-subtle text-success-emphasis rounded border-start border-2 border-success">
-                        <strong>👩‍🏫 先生:</strong> ${r.teacherComment}
+                        <strong>👩‍🏫 先生:</strong> ${escBr(r.teacherComment)}
                       </div>
                     </div>
                   </div>
@@ -238,7 +260,7 @@
     function initClassTab() {
       document.getElementById('dateSelect').innerHTML = '<option value="">読み込み中...</option>';
       google.script.run.withSuccessHandler(dates => {
-        document.getElementById('dateSelect').innerHTML = dates.map(d => `<option value="${d}">${d}</option>`).join('');
+        document.getElementById('dateSelect').innerHTML = dateOptions(dates || []);
       }).getTeacherAvailableDates();
     }
 
@@ -251,14 +273,14 @@
         .withSuccessHandler(res => {
           if (!res) { div.innerHTML = 'データなし'; return; }
           const cacheBadge = res.isCached ? '<span class="badge bg-light text-dark border badge-cache ms-2">保存済みデータから表示</span>' : '';
-          let listHtml = res.reflections.map(r => `<li class="list-group-item small">● ${r.understood}<br><span class="text-danger">▲ ${r.difficult}</span></li>`).join('');
+          let listHtml = res.reflections.map(r => `<li class="list-group-item small">● ${escBr(r.understood)}<br><span class="text-danger">▲ ${escBr(r.difficult)}</span></li>`).join('');
           div.innerHTML = `
             <div class="card bg-primary text-white mb-4 shadow">
               <div class="card-body">
-                <h5 class="card-title">🤖 AI分析 (${res.date})${cacheBadge}</h5>
-                <div class="bg-white text-dark p-3 rounded mt-2">${res.advice.replace(/\n/g, '<br>')}</div>
+                <h5 class="card-title">🤖 AI分析 (${esc(res.date)})${cacheBadge}</h5>
+                <div class="bg-white text-dark p-3 rounded mt-2">${escBr(res.advice)}</div>
                 <div class="mt-3 text-end">
-                  <button class="btn btn-draft btn-sm shadow-sm" onclick="handleGenerateDrafts('${res.date}')">
+                  <button class="btn btn-draft btn-sm shadow-sm" id="btnGenerateDrafts">
                     この日の「先生コメント素案」をO列に一括作成
                   </button>
                 </div>
@@ -266,18 +288,20 @@
             </div>
             <div class="card shadow-sm">
               <div class="card-body">
-                <h5 class="card-title">一覧 (${res.count}名)</h5>
+                <h5 class="card-title">一覧 (${esc(res.count)}名)</h5>
                 <ul class="list-group list-group-flush border-top">${listHtml}</ul>
               </div>
             </div>`;
+          // 日付は onclick 属性に埋め込まず、イベントリスナーで渡す（属性への文字列埋め込みを避ける）
+          const draftBtn = document.getElementById('btnGenerateDrafts');
+          draftBtn.addEventListener('click', () => handleGenerateDrafts(res.date, draftBtn));
         })
         .withFailureHandler(err => showError(div, err))
         .getClassSummary(date);
     }
 
-    function handleGenerateDrafts(date) {
+    function handleGenerateDrafts(date, btn) {
       if (!confirm(date + " の全員に対し、スプレッドシートのO列に先生用コメントの案を作成します。よろしいですか？")) return;
-      const btn = event.target;
       const originalText = btn.innerText;
       btn.disabled = true; btn.innerText = "生成中...";
 
@@ -293,11 +317,10 @@
         .generateTeacherDraftsBulk(date);
     }
 
-    function handleBulkReEvaluate() {
+    function handleBulkReEvaluate(btn) {
       const date = document.getElementById('dateSelect').value;
       if (!date) { alert('対象日を選択してください。'); return; }
       if (!confirm(`${date} の全員のAIコーチ回答を再生成しますか？`)) return;
-      const btn = event.target;
       const originalText = btn.innerText;
       btn.disabled = true; btn.innerText = "処理中...";
       google.script.run

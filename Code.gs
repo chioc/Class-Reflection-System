@@ -58,7 +58,16 @@ function colNo_(idx) {
 function getActiveEmail_() {
   var email = Session.getActiveUser().getEmail();
   if (!email) throw new Error('ログイン情報が取得できません。');
-  return email.trim().toLowerCase();
+  email = email.trim().toLowerCase();
+  assertSafeDeployment_(email);
+  return email;
+}
+
+/** スクリプトプロパティ TEACHER_EMAILS（「,」区切り）を小文字の配列で返す */
+function getTeacherEmails_() {
+  var prop = PropertiesService.getScriptProperties().getProperty('TEACHER_EMAILS');
+  if (!prop) return [];
+  return prop.split(',').map(function(e) { return e.trim().toLowerCase(); }).filter(String);
 }
 
 /**
@@ -67,15 +76,201 @@ function getActiveEmail_() {
 function isTeacherUser_() {
   var email = Session.getActiveUser().getEmail();
   if (!email) return false;
+  return getTeacherEmails_().indexOf(email.trim().toLowerCase()) !== -1;
+}
 
-  var teacherEmailsProp = PropertiesService.getScriptProperties().getProperty('TEACHER_EMAILS');
-  if (!teacherEmailsProp) return false;
+/* =====================================================================
+ *  セキュリティ対策
+ *  - 【デプロイ設定】Webアプリは「次のユーザーとして実行：自分（先生）」で
+ *    公開されていることを前提にする。「ウェブアプリにアクセスしているユーザー」
+ *    で公開されている場合、生徒にスプレッドシートの閲覧権限が必要になり、
+ *    シートを直接開いて全員の氏名・メールアドレスが見えてしまうため、生徒の利用を止める。
+ *  - 【フォーム設定】本人確認はフォームの「メールアドレスを収集」に依存するため、
+ *    「確認済み（Verified）」以外の設定では、生徒向けの記録表示を止める。
+ *  - 先生は GASエディタから checkSecuritySettings を実行して設定を点検できる。
+ * ===================================================================== */
 
-  var teacherEmails = teacherEmailsProp.split(',').map(function(e) {
-    return e.trim().toLowerCase();
-  });
+/** フォーム設定の確認結果をキャッシュする時間（秒） */
+var SECURITY_CACHE_SECONDS = 6 * 60 * 60;
 
-  return teacherEmails.indexOf(email.trim().toLowerCase()) !== -1;
+/** フォームのメール収集設定の値 */
+var EMAIL_COLLECTION = {
+  VERIFIED: 'VERIFIED',             // 確認済み（Googleアカウントのアドレスを自動記録）… 安全
+  RESPONDER_INPUT: 'RESPONDER_INPUT', // 回答者が手入力 … なりすまし可能
+  NONE: 'NONE',                     // 収集しない … なりすまし可能（本人確認できない）
+  UNKNOWN: 'UNKNOWN',               // 判定できない（APIが未対応など）
+  NO_FORM: 'NO_FORM'                // スプレッドシートにフォームがつながっていない
+};
+
+/**
+ * 「自分（先生）として実行」で公開されているかを確認する。
+ * 「アクセスしているユーザーとして実行」の場合、実行ユーザー＝閲覧ユーザーになる。
+ * 先生本人は判別できないため対象外とし、生徒（先生以外）のときだけ止める。
+ */
+function assertSafeDeployment_(activeEmail) {
+  if (getTeacherEmails_().indexOf(activeEmail) !== -1) return;
+  var effective = '';
+  try { effective = (Session.getEffectiveUser().getEmail() || '').trim().toLowerCase(); } catch (e) {}
+  if (effective && effective === activeEmail) {
+    console.error('[security] Webアプリが「アクセスしているユーザーとして実行」で公開されています。生徒の利用を止めました。');
+    throw new Error('システムの公開設定に問題があるため、現在利用できません。先生に連絡してください。');
+  }
+}
+
+/**
+ * スプレッドシートにつながっているフォームのメール収集設定を調べる（キャッシュあり）
+ * 戻り値：EMAIL_COLLECTION のいずれか
+ */
+function getFormEmailCollection_() {
+  var cache = CacheService.getScriptCache();
+  var cached = cache.get('FORM_EMAIL_COLLECTION');
+  if (cached) return cached;
+
+  var result = detectFormEmailCollection_();
+  cache.put('FORM_EMAIL_COLLECTION', result, SECURITY_CACHE_SECONDS);
+  return result;
+}
+
+function detectFormEmailCollection_() {
+  var form = getLinkedForm_();
+  if (!form) return EMAIL_COLLECTION.NO_FORM;
+  try {
+    if (typeof form.getEmailCollectionType === 'function') {
+      var t = form.getEmailCollectionType();
+      if (t === FormApp.EmailCollectionType.VERIFIED) return EMAIL_COLLECTION.VERIFIED;
+      if (t === FormApp.EmailCollectionType.RESPONDER_INPUT) return EMAIL_COLLECTION.RESPONDER_INPUT;
+      if (t === FormApp.EmailCollectionType.DO_NOT_COLLECT) return EMAIL_COLLECTION.NONE;
+    }
+  } catch (e) {
+    console.warn('[security] getEmailCollectionType を取得できません：' + e.message);
+  }
+  try {
+    if (!form.collectsEmail()) return EMAIL_COLLECTION.NONE;
+  } catch (e) {}
+  return EMAIL_COLLECTION.UNKNOWN;
+}
+
+/** 回答シートにつながっているフォーム（なければ null） */
+function getLinkedForm_() {
+  try {
+    var url = getSpreadsheet_().getFormUrl();
+    return url ? FormApp.openByUrl(url) : null;
+  } catch (e) {
+    console.warn('[security] フォームを開けません：' + e.message);
+    return null;
+  }
+}
+
+/**
+ * 生徒向けの記録表示の前に呼ぶ。
+ * フォームのメールアドレスが「確認済み」でない（なりすましが可能な）設定なら止める。
+ * 判定できない場合（UNKNOWN / NO_FORM）は利用を止めずにログを残す
+ * （checkSecuritySettings で先生が確認する）。
+ */
+function assertVerifiedEmailForm_() {
+  var s = getFormEmailCollection_();
+  if (s === EMAIL_COLLECTION.RESPONDER_INPUT || s === EMAIL_COLLECTION.NONE) {
+    console.error('[security] フォームのメールアドレス収集が「確認済み」ではありません（' + s + '）。生徒向け表示を止めました。');
+    throw new Error('フォームの設定に問題があるため、現在記録を表示できません。先生に連絡してください。');
+  }
+  if (s !== EMAIL_COLLECTION.VERIFIED) {
+    console.warn('[security] フォームのメール収集設定を確認できません（' + s + '）。checkSecuritySettings で確認してください。');
+  }
+}
+
+/**
+ * 【教師専用・GASエディタから実行】セキュリティ設定を点検してログに出す
+ *  - フォーム：メールアドレス収集が「確認済み」か／ログイン必須（組織内限定）か
+ *  - スプレッドシート・フォーム・スクリプト：リンク共有の状態、先生以外の編集者・閲覧者
+ *  - スクリプトプロパティ：TEACHER_EMAILS が設定されているか
+ */
+function checkSecuritySettings() {
+  if (!isTeacherUser_()) throw new Error('権限がありません。');
+  CacheService.getScriptCache().remove('FORM_EMAIL_COLLECTION');
+
+  var teachers = getTeacherEmails_();
+  var lines = [];
+  var ng = 0;
+  var ok = function(m) { lines.push('✅ ' + m); };
+  var bad = function(m) { lines.push('❌ ' + m); ng++; };
+  var warn = function(m) { lines.push('⚠️ ' + m); };
+
+  // ① スクリプトプロパティ
+  if (teachers.length) ok('TEACHER_EMAILS：' + teachers.length + '名');
+  else bad('TEACHER_EMAILS が設定されていません。');
+
+  // ② フォーム
+  var form = getLinkedForm_();
+  if (!form) {
+    warn('回答シートにつながっているフォームが見つかりません。フォーム側の設定を手動で確認してください。');
+  } else {
+    var ec = detectFormEmailCollection_();
+    if (ec === EMAIL_COLLECTION.VERIFIED) ok('フォーム：メールアドレスの収集が「確認済み」です。');
+    else if (ec === EMAIL_COLLECTION.UNKNOWN) warn('フォーム：メールアドレスの収集方法を判定できません。フォームの「設定 → 回答 → メールアドレスを収集」が「確認済み」か手動で確認してください。');
+    else bad('フォーム：メールアドレスの収集が「確認済み」ではありません（' + ec + '）。他人のアドレスで提出して記録を盗み見られます。fixFormEmailCollection を実行するか、フォームの設定で「確認済み」にしてください。');
+    try {
+      if (form.requiresLogin()) ok('フォーム：組織内のユーザーに限定されています。');
+      else bad('フォーム：組織外のユーザーも回答できます。フォームの設定で「（組織名）のユーザーに限定する」をオンにしてください。');
+    } catch (e) {
+      warn('フォーム：組織内限定の設定を確認できません（個人アカウントの場合は対象外）。');
+    }
+    checkFileSharing_(form.getId(), 'フォーム', teachers, ok, bad, warn);
+  }
+
+  // ③ スプレッドシート（生徒の氏名・メールアドレスを含む）
+  checkFileSharing_(getSpreadsheet_().getId(), 'スプレッドシート', teachers, ok, bad, warn);
+
+  // ④ スクリプト（APIキーを読める）
+  try {
+    checkFileSharing_(ScriptApp.getScriptId(), 'スクリプト', teachers, ok, bad, warn);
+  } catch (e) {
+    warn('スクリプト：共有設定を確認できません（スプレッドシートに紐づくスクリプトの場合は、スプレッドシートの共有設定が適用されます）。');
+  }
+
+  // ⑤ デプロイ設定（コードからは読めないため手順を案内）
+  warn('デプロイ設定は手動で確認してください：「デプロイ → デプロイを管理」で「次のユーザーとして実行：自分」「アクセスできるユーザー：（組織名）内の全員」になっていること。');
+
+  var msg = '【セキュリティ点検】問題 ' + ng + ' 件\n' + lines.join('\n');
+  Logger.log(msg);
+  return msg;
+}
+
+/** ファイルの共有状態を点検する（先生以外の編集者・閲覧者、リンク共有） */
+function checkFileSharing_(fileId, label, teachers, ok, bad, warn) {
+  var file;
+  try {
+    file = DriveApp.getFileById(fileId);
+  } catch (e) {
+    warn(label + '：共有設定を確認できません（' + e.message + '）');
+    return;
+  }
+  var access = file.getSharingAccess();
+  if (access === DriveApp.Access.PRIVATE) {
+    ok(label + '：リンク共有はオフです。');
+  } else {
+    bad(label + '：リンク共有がオンです（' + access + ' / ' + file.getSharingPermission() + '）。「制限付き」にしてください。');
+  }
+  var owner = '';
+  try { owner = (file.getOwner().getEmail() || '').toLowerCase(); } catch (e) {}
+  var others = file.getEditors().concat(file.getViewers())
+    .map(function(u) { return (u.getEmail() || '').toLowerCase(); })
+    .filter(function(e) { return e && e !== owner && teachers.indexOf(e) === -1; });
+  // 重複を除く
+  others = others.filter(function(e, i) { return others.indexOf(e) === i; });
+  if (others.length === 0) ok(label + '：先生以外の共有相手はいません。');
+  else bad(label + '：先生以外に共有されています → ' + others.join(', '));
+}
+
+/** 【教師専用・GASエディタから実行】フォームのメールアドレス収集を「確認済み」にする */
+function fixFormEmailCollection() {
+  if (!isTeacherUser_()) throw new Error('権限がありません。');
+  var form = getLinkedForm_();
+  if (!form) throw new Error('回答シートにつながっているフォームが見つかりません。');
+  form.setEmailCollectionType(FormApp.EmailCollectionType.VERIFIED);
+  CacheService.getScriptCache().remove('FORM_EMAIL_COLLECTION');
+  var msg = 'フォームのメールアドレス収集を「確認済み」に変更しました。';
+  Logger.log(msg);
+  return msg;
 }
 
 function getSpreadsheet_() {
@@ -239,6 +434,16 @@ function callOpenAI_(messages, opts) {
  * ===================================================================== */
 
 function doGet(e) {
+  // 【セキュリティ】ログインしていない／公開設定が危険な場合は画面を出さない
+  try {
+    getActiveEmail_();
+  } catch (err) {
+    return HtmlService.createHtmlOutput(
+      '<p style="font-family:sans-serif;padding:2rem;text-align:center;">' +
+      escapeHtml_(err.message) + '<br>学校のGoogleアカウントでログインしてから開いてください。</p>'
+    ).setTitle('Re:Point');
+  }
+
   var template = HtmlService.createTemplateFromFile('index');
   template.isTeacher = isTeacherUser_();
   template.classList = CLASS_LIST;
@@ -247,11 +452,19 @@ function doGet(e) {
     .addMetaTag('viewport', 'width=device-width, initial-scale=1');
 }
 
+/** サーバー側で組み立てるHTML用のエスケープ */
+function escapeHtml_(s) {
+  return String(s === null || s === undefined ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
 /**
  * ログイン中のユーザーのレコードを返す（個人用：名前あり）
  */
 function getUserRecords() {
   var target = getActiveEmail_();
+  if (!isTeacherUser_()) assertVerifiedEmailForm_();
   var data = getAnswerData_();
   var out = [];
 
@@ -316,6 +529,7 @@ function getClassReflectionsForStudents(targetDate, classNo) {
 
   var email = getActiveEmail_();
   var isTeacher = isTeacherUser_();
+  if (!isTeacher) assertVerifiedEmailForm_();
   var data = getAnswerData_();
   var targetClass;
 
@@ -355,6 +569,7 @@ function getClassReflectionsForStudents(targetDate, classNo) {
 function getPlazaAvailableDates() {
   var target = getActiveEmail_();
   var isTeacher = isTeacherUser_();
+  if (!isTeacher) assertVerifiedEmailForm_();
   var data = getAnswerData_();
   var datesObj = {};
 
