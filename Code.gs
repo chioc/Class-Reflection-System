@@ -65,7 +65,7 @@ function getActiveEmail_() {
 
 /** スクリプトプロパティ TEACHER_EMAILS（「,」区切り）を小文字の配列で返す */
 function getTeacherEmails_() {
-  var prop = PropertiesService.getScriptProperties().getProperty('TEACHER_EMAILS');
+  var prop = scriptProps_().TEACHER_EMAILS;
   if (!prop) return [];
   return prop.split(',').map(function(e) { return e.trim().toLowerCase(); }).filter(String);
 }
@@ -287,26 +287,300 @@ function fixFormEmailCollection() {
   return msg;
 }
 
+/* =====================================================================
+ *  【高速化】1回の実行の中での使い回し
+ *  GASでは SpreadsheetApp.openById やプロパティの読み込みが1回ごとに時間がかかるため、
+ *  同じ実行の中では1度だけ行う。
+ * ===================================================================== */
+var memo_ = {};
+
+/** スクリプトプロパティ（1回の実行で1度だけ読む） */
+function scriptProps_() {
+  if (!memo_.props) memo_.props = PropertiesService.getScriptProperties().getProperties();
+  return memo_.props;
+}
+
 function getSpreadsheet_() {
-  var ssId = PropertiesService.getScriptProperties().getProperty('SPREADSHEET_ID');
+  if (memo_.ss) return memo_.ss;
+  var ssId = scriptProps_().SPREADSHEET_ID;
   if (!ssId) throw new Error('SPREADSHEET_IDが設定されていません。');
-  return SpreadsheetApp.openById(ssId);
+  memo_.ss = SpreadsheetApp.openById(ssId);
+  return memo_.ss;
+}
+
+/** 回答シート */
+function getAnswerSheet_() {
+  if (memo_.answerSheet) return memo_.answerSheet;
+  var sheet = getSpreadsheet_().getSheetByName(SHEET_ANSWERS);
+  if (!sheet) throw new Error('シート「' + SHEET_ANSWERS + '」が見つかりません。');
+  memo_.answerSheet = sheet;
+  return sheet;
 }
 
 /** 回答シートの全データ（見出し行を含む） */
 function getAnswerData_() {
-  var sheet = getSpreadsheet_().getSheetByName(SHEET_ANSWERS);
-  if (!sheet) throw new Error('シート「' + SHEET_ANSWERS + '」が見つかりません。');
-  return sheet.getDataRange().getValues();
+  return getAnswerSheet_().getDataRange().getValues();
+}
+
+/** 回答シートで読む列数（A〜R列。シートの列がそれより多くても余分な列は読まない） */
+function answerWidth_() {
+  return colNo_(COL.CHECK_FLAG);
+}
+
+/**
+ * 【高速化】指定日の行だけを読む
+ * 1) A列（タイムスタンプ）だけを読んで、その日の最初と最後の行を探す
+ * 2) その範囲だけをA〜R列で読む
+ * フォームの回答は時刻順に追加されるため、同じ日の行はほぼ連続している。
+ * 戻り値：{ start: 最初の行番号（1始まり）, rows: 行データの配列 }
+ *   rows には途中に別の日の行が混ざることがあるので、呼び出し側で日付を確認すること。
+ */
+function readDateBlock_(dateKey) {
+  var sheet = getAnswerSheet_();
+  var last = sheet.getLastRow();
+  if (last < 2) return { start: 2, rows: [] };
+  var ts = sheet.getRange(2, 1, last - 1, 1).getValues();
+  var first = -1, end = -1;
+  for (var i = 0; i < ts.length; i++) {
+    if (toDateKey_(ts[i][0]) === dateKey) {
+      if (first < 0) first = i;
+      end = i;
+    }
+  }
+  if (first < 0) return { start: 2, rows: [] };
+  return { start: first + 2, rows: sheet.getRange(first + 2, 1, end - first + 1, answerWidth_()).getValues() };
 }
 
 /** セルの値を 'yyyy/MM/dd' の日付キーに変換（変換できなければ ''） */
+var DATE_KEY_BUCKET_MS = 15 * 60 * 1000;   // 時差は15分単位なので、15分ごとに結果を使い回せる
 function toDateKey_(v) {
   if (v instanceof Date) {
-    return Utilities.formatDate(v, Session.getScriptTimeZone(), 'yyyy/MM/dd');
+    // 【高速化】Utilities.formatDate は呼び出しに時間がかかるため、15分単位で結果を覚えておく
+    var t = v.getTime();
+    if (isNaN(t)) return '';
+    var bucket = Math.floor(t / DATE_KEY_BUCKET_MS);
+    var dk = memo_.dateKeys || (memo_.dateKeys = {});
+    if (dk[bucket] === undefined) {
+      if (!memo_.tz) memo_.tz = Session.getScriptTimeZone();
+      dk[bucket] = Utilities.formatDate(v, memo_.tz, 'yyyy/MM/dd');
+    }
+    return dk[bucket];
   }
   if (v === null || v === undefined || v === '') return '';
   return v.toString().substring(0, 10).replace(/-/g, '/');
+}
+
+/* =====================================================================
+ *  【高速化】キャッシュ（CacheService）
+ *  - 個人の記録・広場（日付×クラス）・提出日の一覧を、サーバー側のキャッシュに置く
+ *  - データが変わったら該当するキャッシュを消す（フォーム送信、AIコメントの書き込み、
+ *    赤ペンの保存、先生がシートを直接編集したとき など）
+ *  - 先生がシートを直接編集したことを知るには、setupFastLoading で編集トリガーを登録する。
+ *    登録していない間は、念のためキャッシュの有効時間を2分に短くする。
+ *  - キャッシュはスクリプトの内部にだけあり、生徒が直接読むことはできない。
+ * ===================================================================== */
+
+var CACHE_TTL_LONG = 6 * 60 * 60;   // 編集トリガーあり：6時間（CacheServiceの上限）
+var CACHE_TTL_SHORT = 120;          // 編集トリガーなし：2分
+var CACHE_CHUNK_CHARS = 25000;      // 1つの値は100KBまでなので、日本語（1文字最大3バイト）でも収まる長さに分ける
+var CACHE_MAX_CHUNKS = 20;
+
+function cacheTtl_() {
+  return scriptProps_().FAST_CACHE_TRIGGERS === 'on' ? CACHE_TTL_LONG : CACHE_TTL_SHORT;
+}
+
+/** キャッシュの「世代」。並べ替え・行の削除・名簿の変更など、全体に影響する変更で1つ進めて全キャッシュを無効にする */
+function cacheGen_() {
+  return scriptProps_().CACHE_GEN || '0';
+}
+
+function cacheFullKey_(key) {
+  return 'v' + cacheGen_() + ':' + key;
+}
+
+function userCacheKey_(email) { return 'rec:' + email; }
+function plazaCacheKey_(dateKey, cls) { return 'plaza:' + dateKey + '|' + cls; }
+var DATES_CACHE_KEY = 'dates:all';
+
+/** キャッシュから読む（なければ null） */
+function cacheGetJson_(key) {
+  try {
+    var cache = CacheService.getScriptCache();
+    var full = cacheFullKey_(key);
+    var meta = cache.get(full);
+    if (!meta) return null;
+    var m = JSON.parse(meta);
+    var keys = [];
+    for (var i = 0; i < m.n; i++) keys.push(full + '#' + m.t + '#' + i);
+    var got = cache.getAll(keys);
+    var parts = [];
+    for (var j = 0; j < keys.length; j++) {
+      if (got[keys[j]] === undefined || got[keys[j]] === null) return null;
+      parts.push(got[keys[j]]);
+    }
+    return JSON.parse(parts.join(''));
+  } catch (e) {
+    console.warn('[cache] 読み込み失敗：' + e.message);
+    return null;
+  }
+}
+
+/**
+ * キャッシュに書く
+ * startedAt：シートを読み始めた時刻。読んでいる間にデータが更新された（キャッシュが消された）場合は、
+ *            古いデータをキャッシュに残さないよう書き込まない。
+ */
+function cachePutJson_(key, obj, startedAt) {
+  try {
+    var cache = CacheService.getScriptCache();
+    var full = cacheFullKey_(key);
+    if (startedAt) {
+      var inv = cache.get(full + '#inv');
+      if (inv && Number(inv) >= startedAt - 2000) return;
+    }
+    var s = JSON.stringify(obj);
+    var n = Math.max(1, Math.ceil(s.length / CACHE_CHUNK_CHARS));
+    if (n > CACHE_MAX_CHUNKS) return;   // 大きすぎるものはキャッシュしない
+    var token = Utilities.getUuid().substring(0, 8);
+    var map = {};
+    for (var i = 0; i < n; i++) map[full + '#' + token + '#' + i] = s.substring(i * CACHE_CHUNK_CHARS, (i + 1) * CACHE_CHUNK_CHARS);
+    map[full] = JSON.stringify({ t: token, n: n });
+    cache.putAll(map, cacheTtl_());
+  } catch (e) {
+    console.warn('[cache] 書き込み失敗：' + e.message);
+  }
+}
+
+/** キャッシュを消す（消した時刻も記録し、読み込み中の古いデータが書き戻されるのを防ぐ） */
+function invalidateCache_(keys) {
+  if (!keys || !keys.length) return;
+  try {
+    var cache = CacheService.getScriptCache();
+    var fulls = [], stamps = {}, now = String(Date.now());
+    keys.forEach(function(k) {
+      var f = cacheFullKey_(k);
+      if (fulls.indexOf(f) !== -1) return;
+      fulls.push(f);
+      stamps[f + '#inv'] = now;
+    });
+    cache.removeAll(fulls);
+    cache.putAll(stamps, CACHE_TTL_LONG);
+  } catch (e) {
+    console.warn('[cache] 削除失敗：' + e.message);
+  }
+}
+
+/** 行データの配列から、影響を受けるキャッシュ（生徒・広場・日付一覧）を消す */
+function invalidateRowsCache_(rows) {
+  var keys = [DATES_CACHE_KEY];
+  rows.forEach(function(row) {
+    var email = String(row[COL.EMAIL] || '').trim().toLowerCase();
+    if (email) keys.push(userCacheKey_(email));
+    var dk = toDateKey_(row[COL.TIMESTAMP]);
+    if (dk) {
+      keys.push(plazaCacheKey_(dk, rowClass_(row)));
+      var raw = normalizeClass_(row[COL.CLASS_NO]);
+      if (raw) keys.push(plazaCacheKey_(dk, raw));
+    }
+  });
+  invalidateCache_(keys);
+}
+
+/** 全キャッシュを無効にする（世代を進める） */
+function bumpCacheGeneration_() {
+  var next = String(Date.now());
+  PropertiesService.getScriptProperties().setProperty('CACHE_GEN', next);
+  scriptProps_().CACHE_GEN = next;
+}
+
+/** 【教師専用・GASエディタから実行】全キャッシュを消す（表示がおかしいときに） */
+function clearAllCaches() {
+  if (!isTeacherUser_()) throw new Error('権限がありません。');
+  bumpCacheGeneration_();
+  CacheService.getScriptCache().removeAll(['ROSTER_JSON', 'FORM_EMAIL_COLLECTION']);
+  var msg = 'キャッシュをすべて消しました。';
+  Logger.log(msg);
+  return msg;
+}
+
+/**
+ * 【教師専用・GASエディタから一度実行】高速表示用の編集トリガーを登録する
+ * 先生がスプレッドシートを直接編集（先生コメントの入力など）したときに、該当するキャッシュを消せるようになる。
+ * 登録後はキャッシュの有効時間が長くなり、表示がより速くなる。
+ */
+function setupFastLoading() {
+  if (!isTeacherUser_()) throw new Error('権限がありません。');
+  var ss = getSpreadsheet_();
+  var handlers = ScriptApp.getProjectTriggers().map(function(t) { return t.getHandlerFunction(); });
+  var msgs = [];
+  if (handlers.indexOf('onSheetEditForCache') === -1) {
+    ScriptApp.newTrigger('onSheetEditForCache').forSpreadsheet(ss).onEdit().create();
+    msgs.push('編集トリガーを登録');
+  }
+  if (handlers.indexOf('onSheetChangeForCache') === -1) {
+    ScriptApp.newTrigger('onSheetChangeForCache').forSpreadsheet(ss).onChange().create();
+    msgs.push('変更トリガーを登録');
+  }
+  PropertiesService.getScriptProperties().setProperty('FAST_CACHE_TRIGGERS', 'on');
+  scriptProps_().FAST_CACHE_TRIGGERS = 'on';
+  bumpCacheGeneration_();
+  var msg = '高速表示を有効にしました' + (msgs.length ? '（' + msgs.join('、') + '）' : '') + '。';
+  Logger.log(msg);
+  return msg;
+}
+
+/** 【教師専用・GASエディタから実行】高速表示用のトリガーを外す（キャッシュは2分の短い有効時間に戻る） */
+function stopFastLoading() {
+  if (!isTeacherUser_()) throw new Error('権限がありません。');
+  ScriptApp.getProjectTriggers().forEach(function(t) {
+    var h = t.getHandlerFunction();
+    if (h === 'onSheetEditForCache' || h === 'onSheetChangeForCache') ScriptApp.deleteTrigger(t);
+  });
+  PropertiesService.getScriptProperties().setProperty('FAST_CACHE_TRIGGERS', 'off');
+  scriptProps_().FAST_CACHE_TRIGGERS = 'off';
+  bumpCacheGeneration_();
+  var msg = '高速表示用のトリガーを外しました。';
+  Logger.log(msg);
+  return msg;
+}
+
+/**
+ * 【セキュリティ】このプロジェクトのトリガーから呼ばれたかを確認する
+ * （ブラウザから google.script.run で偽のイベントを渡されても動かないようにする）
+ */
+function isOwnTriggerEvent_(e) {
+  if (!e || typeof e.triggerUid !== 'string' || !e.triggerUid) return false;
+  try {
+    return ScriptApp.getProjectTriggers().some(function(t) { return t.getUniqueId() === e.triggerUid; });
+  } catch (err) {
+    return false;
+  }
+}
+
+/** 編集トリガー：先生がシートを直接編集したら、該当するキャッシュを消す */
+function onSheetEditForCache(e) {
+  if (!isOwnTriggerEvent_(e) || !e.range || typeof e.range.getSheet !== 'function') return;
+  var sheet = e.range.getSheet();
+  var name = sheet.getName();
+  if (name === SHEET_ANSWERS) {
+    var r0 = Math.max(2, e.range.getRow());
+    var r1 = e.range.getRow() + e.range.getNumRows() - 1;
+    if (r1 < r0) return;
+    if (r1 - r0 + 1 > 200) { bumpCacheGeneration_(); return; }   // 大量の編集は全体を無効に
+    invalidateRowsCache_(sheet.getRange(r0, 1, r1 - r0 + 1, colNo_(COL.CLASS_NO)).getValues());
+  } else if (name === SHEET_ROSTER || name === SHEET_TEACHER_REVIEWS) {
+    CacheService.getScriptCache().remove('ROSTER_JSON');
+    bumpCacheGeneration_();
+  }
+}
+
+/** 変更トリガー：行の削除・並べ替えなど、行の位置が変わる変更では全キャッシュを無効にする */
+function onSheetChangeForCache(e) {
+  if (!isOwnTriggerEvent_(e)) return;
+  var t = String(e.changeType || '');
+  if (['REMOVE_ROW', 'INSERT_COLUMN', 'REMOVE_COLUMN', 'REMOVE_GRID', 'OTHER'].indexOf(t) !== -1) {
+    bumpCacheGeneration_();
+  }
 }
 
 /** 'yyyy/MM/dd' 形式かどうか */
@@ -476,6 +750,7 @@ function setupRosterSheet() {
   var rows = Object.keys(seen).sort().map(function(em) { return [em, seen[em]]; });
   if (rows.length) sheet.getRange(2, 1, rows.length, 2).setValues(safeValues_(rows));
   CacheService.getScriptCache().remove('ROSTER_JSON');
+  bumpCacheGeneration_();
   return '「' + SHEET_ROSTER + '」シートを作成しました（' + rows.length + '名分の下書き）。内容を確認・修正してください。';
 }
 
@@ -484,17 +759,21 @@ function setupRosterSheet() {
  *  スクリプトプロパティ AI_DAILY_LIMIT_PER_USER（既定 5）
  * --------------------------------------------------------------------- */
 
+var DAILY_LIMIT_SCAN_ROWS = 2000;
+
 /** 同じ生徒の、同じ日の提出が上限を超えているか（row は回答シート上の行番号・1始まり） */
 function isOverDailyLimit_(sheet, rowNo) {
   var limit = getIntProp_('AI_DAILY_LIMIT_PER_USER', 5);
   if (limit <= 0) return false;
-  var values = sheet.getRange(1, 1, rowNo, colNo_(COL.EMAIL)).getValues();
-  var me = values[rowNo - 1];
+  // 【高速化】回答は時刻順に並ぶので、直近の行だけを読む（1日の提出数より十分多い範囲）
+  var start = Math.max(2, rowNo - DAILY_LIMIT_SCAN_ROWS);
+  var values = sheet.getRange(start, 1, rowNo - start + 1, colNo_(COL.EMAIL)).getValues();
+  var me = values[values.length - 1];
   var email = String(me[COL.EMAIL] || '').trim().toLowerCase();
   var day = toDateKey_(me[COL.TIMESTAMP]);
   if (!email || !day) return false;
   var n = 0;
-  for (var i = 1; i < rowNo - 1; i++) {   // 今回の行（rowNo - 1）は数えない
+  for (var i = 0; i < values.length - 1; i++) {   // 今回の行（最後の行）は数えない
     if (String(values[i][COL.EMAIL] || '').trim().toLowerCase() === email &&
         toDateKey_(values[i][COL.TIMESTAMP]) === day) n++;
   }
@@ -605,10 +884,25 @@ function doGet(e) {
 
   var template = HtmlService.createTemplateFromFile('index');
   template.isTeacher = isTeacherUser_();
+  // 【高速化】最初の画面に個人の記録を埋め込み、表示までのサーバーとの往復を1回減らす
+  // （取得に失敗したときは null にして、これまでどおり画面側から読み込む）
+  var initial = null;
+  try { initial = getUserRecords(); } catch (err) { initial = null; }
+  template.initialRecordsJson = jsonForScript_(initial);
   template.classList = CLASS_LIST;
   return template.evaluate()
     .setTitle('Re:Point')
     .addMetaTag('viewport', 'width=device-width, initial-scale=1');
+}
+
+/**
+ * 【セキュリティ】<script> の中に埋め込むためのJSON
+ * 「</script>」などで埋め込み先から抜け出せないよう、< > & と改行文字をエスケープする
+ */
+function jsonForScript_(v) {
+  return JSON.stringify(v === undefined ? null : v)
+    .replace(/</g, '\\u003c').replace(/>/g, '\\u003e').replace(/&/g, '\\u0026')
+    .replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
 }
 
 /** サーバー側で組み立てるHTML用のエスケープ */
@@ -624,21 +918,54 @@ function escapeHtml_(s) {
 function getUserRecords() {
   var target = getActiveEmail_();
   if (!isTeacherUser_()) assertVerifiedEmailForm_();
-  var data = getAnswerData_();
+  return userRecordsFor_(target);
+}
+
+/** 【高速化】指定した生徒の記録（キャッシュがあればキャッシュから） */
+function userRecordsFor_(email) {
+  var key = userCacheKey_(email);
+  var cached = cacheGetJson_(key);
+  if (cached) return cached;
+  var startedAt = Date.now();
+  var out = buildUserRecords_(email);
+  cachePutJson_(key, out, startedAt);
+  return out;
+}
+
+/**
+ * 指定した生徒の記録をシートから作る
+ * 【高速化】まずB列（メールアドレス）だけを読み、その生徒の行がある範囲だけをA〜R列で読む
+ */
+function buildUserRecords_(target) {
+  var sheet = getAnswerSheet_();
+  var last = sheet.getLastRow();
+  if (last < 2) return [];
+  var emails = sheet.getRange(2, colNo_(COL.EMAIL), last - 1, 1).getValues();
+  var first = -1, end = -1;
+  for (var k = 0; k < emails.length; k++) {
+    if (String(emails[k][0] || '').trim().toLowerCase() === target) {
+      if (first < 0) first = k;
+      end = k;
+    }
+  }
+  if (first < 0) return [];
+  var block = sheet.getRange(first + 2, 1, end - first + 1, answerWidth_()).getValues();
   var reviews = loadTeacherReviews_(getSpreadsheet_());
+  var tz = memo_.tz || (memo_.tz = Session.getScriptTimeZone());
   var out = [];
 
-  for (var i = 1; i < data.length; i++) {
-    var row = data[i];
+  for (var i = 0; i < block.length; i++) {
+    var row = block[i];
     var rowEmail = (row[COL.EMAIL] || '').toString().trim().toLowerCase();
     if (rowEmail !== target) continue;
 
     var ts = row[COL.TIMESTAMP];
     out.push({
       timestamp: ts instanceof Date
-        ? Utilities.formatDate(ts, Session.getScriptTimeZone(), 'yyyy/MM/dd HH:mm')
+        ? Utilities.formatDate(ts, tz, 'yyyy/MM/dd HH:mm')
         : String(ts),
-      classNo:        normalizeClass_(row[COL.CLASS_NO]),
+      dateKey:        toDateKey_(ts),
+      classNo:        rowClass_(row),
       name:           getNameByClass_(row),
       learned:        String(row[COL.LEARNED]         || ''),
       understood:     String(row[COL.UNDERSTOOD]      || ''),
@@ -661,14 +988,11 @@ function getUserRecords() {
  * 生徒が指定日に提出した行から、その日のクラスを求める
  * （その日に提出していなければ ''。複数提出がある場合は最後の提出を採用）
  */
-function findOwnClassOnDate_(data, email, targetDate) {
+function findOwnClassOnDate_(email, targetDate) {
   var found = '';
-  for (var i = 1; i < data.length; i++) {
-    var rowEmail = (data[i][COL.EMAIL] || '').toString().trim().toLowerCase();
-    if (rowEmail === email && toDateKey_(data[i][COL.TIMESTAMP]) === targetDate) {
-      found = rowClass_(data[i]);
-    }
-  }
+  userRecordsFor_(email).forEach(function(r) {
+    if (r.dateKey === targetDate) found = r.classNo;
+  });
   return found;
 }
 
@@ -722,21 +1046,38 @@ function getClassReflectionsForStudents(targetDate, classNo) {
   var email = getActiveEmail_();
   var isTeacher = isTeacherUser_();
   if (!isTeacher) assertVerifiedEmailForm_();
-  var data = getAnswerData_();
   var targetClass;
 
   if (isTeacher) {
     targetClass = normalizeClass_(classNo);
     if (CLASS_LIST.indexOf(targetClass) === -1) throw new Error('クラスを選択してください。');
   } else {
-    targetClass = findOwnClassOnDate_(data, email, targetDate);
+    targetClass = findOwnClassOnDate_(email, targetDate);
     if (!targetClass) throw new Error('この日の広場は表示できません（自分が提出した日だけ見ることができます）。');
   }
 
-  var reviews = loadTeacherReviews_(getSpreadsheet_());
+  // 【高速化】日付×クラスごとにキャッシュする（クラス全員が同時に開いてもシートは1回だけ読む）
+  var key = plazaCacheKey_(targetDate, targetClass);
+  var out = cacheGetJson_(key);
+  if (!out) {
+    var startedAt = Date.now();
+    out = buildPlazaRecords_(targetDate, targetClass);
+    cachePutJson_(key, out, startedAt);
+  }
+
+  // 【匿名性】並び順をランダムにしてから番号を付ける（提出順や毎回同じ番号から個人を特定されないように）
+  shuffle_(out).forEach(function(r, idx) { r.name = '生徒 ' + (idx + 1); });
+
+  return { date: targetDate, classNo: targetClass, records: out };
+}
+
+/** 広場の記録をシートから作る（氏名・メールアドレスは含めない） */
+function buildPlazaRecords_(targetDate, targetClass) {
+  var block = readDateBlock_(targetDate);
+  var reviews = block.rows.length ? loadTeacherReviews_(getSpreadsheet_()) : {};
   var out = [];
-  for (var i = 1; i < data.length; i++) {
-    var row = data[i];
+  for (var i = 0; i < block.rows.length; i++) {
+    var row = block.rows[i];
     if (toDateKey_(row[COL.TIMESTAMP]) !== targetDate) continue;
     if (rowClass_(row) !== targetClass) continue;
 
@@ -755,11 +1096,7 @@ function getClassReflectionsForStudents(targetDate, classNo) {
       }
     });
   }
-
-  // 【匿名性】並び順をランダムにしてから番号を付ける（提出順や毎回同じ番号から個人を特定されないように）
-  shuffle_(out).forEach(function(r, idx) { r.name = '生徒 ' + (idx + 1); });
-
-  return { date: targetDate, classNo: targetClass, records: out };
+  return out;
 }
 
 /**
@@ -768,21 +1105,31 @@ function getClassReflectionsForStudents(targetDate, classNo) {
 function getPlazaAvailableDates() {
   var target = getActiveEmail_();
   var isTeacher = isTeacherUser_();
-  if (!isTeacher) assertVerifiedEmailForm_();
-  var data = getAnswerData_();
+  if (isTeacher) return allSubmissionDates_();
+  assertVerifiedEmailForm_();
+  // 【高速化】生徒の提出日は、自分の記録（キャッシュ）から求める
   var datesObj = {};
-
-  for (var i = 1; i < data.length; i++) {
-    var key = toDateKey_(data[i][COL.TIMESTAMP]);
-    if (!key) continue;
-    if (isTeacher) {
-      datesObj[key] = true;
-    } else {
-      var rowEmail = (data[i][COL.EMAIL] || '').toString().trim().toLowerCase();
-      if (rowEmail === target) datesObj[key] = true;
-    }
-  }
+  userRecordsFor_(target).forEach(function(r) { if (r.dateKey) datesObj[r.dateKey] = true; });
   return Object.keys(datesObj).sort(function(a, b) { return a > b ? -1 : 1; });
+}
+
+/** すべての提出日（新しい順）。【高速化】A列だけを読み、結果をキャッシュする */
+function allSubmissionDates_() {
+  var cached = cacheGetJson_(DATES_CACHE_KEY);
+  if (cached) return cached;
+  var startedAt = Date.now();
+  var sheet = getAnswerSheet_();
+  var last = sheet.getLastRow();
+  var datesObj = {};
+  if (last >= 2) {
+    sheet.getRange(2, 1, last - 1, 1).getValues().forEach(function(r) {
+      var key = toDateKey_(r[0]);
+      if (key) datesObj[key] = true;
+    });
+  }
+  var out = Object.keys(datesObj).sort(function(a, b) { return a > b ? -1 : 1; });
+  cachePutJson_(DATES_CACHE_KEY, out, startedAt);
+  return out;
 }
 
 /* =====================================================================
@@ -794,13 +1141,7 @@ function getPlazaAvailableDates() {
  */
 function getTeacherAvailableDates() {
   if (!isTeacherUser_()) throw new Error('権限がありません。');
-  var data = getAnswerData_();
-  var datesObj = {};
-  for (var i = 1; i < data.length; i++) {
-    var key = toDateKey_(data[i][COL.TIMESTAMP]);
-    if (key) datesObj[key] = true;
-  }
-  return Object.keys(datesObj).sort(function(a, b) { return a > b ? -1 : 1; });
+  return allSubmissionDates_();
 }
 
 /**
@@ -813,7 +1154,15 @@ function onFormSubmit(e) {
 
   var sheet = e.range.getSheet();
   if (sheet.getName() !== SHEET_ANSWERS) return;
+  try {
+    handleFormSubmit_(e, sheet);
+  } finally {
+    // 【高速化】提出した生徒の記録・その日の広場・日付一覧のキャッシュを消す
+    invalidateRowsCache_(sheet.getRange(e.range.getRow(), 1, 1, colNo_(COL.CLASS_NO)).getValues());
+  }
+}
 
+function handleFormSubmit_(e, sheet) {
   var row  = e.range.getRow();
   var data = e.values; // 文字列の配列（列の並びはシートと同じ）
 
@@ -866,15 +1215,15 @@ function generateTeacherDraftsBulk(targetDate) {
   var ss = getSpreadsheet_();
   var lessonContext = getLessonContext_(ss, targetDate, '本時の詳細は未設定です。');
 
-  var sheet = ss.getSheetByName(SHEET_ANSWERS);
-  var data = sheet.getDataRange().getValues();
+  var sheet = getAnswerSheet_();
+  var block = readDateBlock_(targetDate);   // 【高速化】その日の行だけを読む
   var count = 0;
 
-  for (var i = 1; i < data.length; i++) {
-    if (toDateKey_(data[i][COL.TIMESTAMP]) !== targetDate) continue;
+  for (var i = 0; i < block.rows.length; i++) {
+    if (toDateKey_(block.rows[i][COL.TIMESTAMP]) !== targetDate) continue;
     try {
-      var draft = generateAiTeacherDraftWithContext_(buildStudentInput_(data[i], ''), lessonContext);
-      sheet.getRange(i + 1, colNo_(COL.TEACHER_DRAFT)).setValue(safeCell_(sanitizeComment_(draft)));
+      var draft = generateAiTeacherDraftWithContext_(buildStudentInput_(block.rows[i], ''), lessonContext);
+      sheet.getRange(block.start + i, colNo_(COL.TEACHER_DRAFT)).setValue(safeCell_(sanitizeComment_(draft)));
       count++;
     } catch (e) {}
   }
@@ -956,9 +1305,9 @@ function getClassSummary(targetDate) {
   if (!isTeacherUser_()) throw new Error('権限がありません。');
   if (!isValidDateKey_(targetDate)) throw new Error('日付の指定が正しくありません。');
   var ss = getSpreadsheet_();
-  var data = ss.getSheetByName(SHEET_ANSWERS).getDataRange().getValues();
+  var data = readDateBlock_(targetDate).rows;   // 【高速化】その日の行だけを読む
   var classReflections = [];
-  for (var i = 1; i < data.length; i++) {
+  for (var i = 0; i < data.length; i++) {
     if (toDateKey_(data[i][COL.TIMESTAMP]) === targetDate) {
       classReflections.push({
         understood: String(data[i][COL.UNDERSTOOD] || ''),
@@ -1009,17 +1358,22 @@ function bulkReEvaluate(targetDate) {
   var ss = getSpreadsheet_();
   var lessonContext = getLessonContext_(ss, targetDate, '技術科の授業');
 
-  var sheet = ss.getSheetByName(SHEET_ANSWERS);
-  var data = sheet.getDataRange().getValues();
-  var count = 0;
-  for (var i = 1; i < data.length; i++) {
-    if (toDateKey_(data[i][COL.TIMESTAMP]) !== targetDate) continue;
-    try {
-      var comment = sanitizeComment_(generateAiCommentWithContext_(buildStudentInput_(data[i], ''), lessonContext));
-      if (!comment) continue;
-      sheet.getRange(i + 1, colNo_(COL.AI_COACH)).setValue(safeCell_(comment));
-      count++;
-    } catch (e) {}
+  var sheet = getAnswerSheet_();
+  var block = readDateBlock_(targetDate);   // 【高速化】その日の行だけを読む
+  var count = 0, changed = [];
+  try {
+    for (var i = 0; i < block.rows.length; i++) {
+      if (toDateKey_(block.rows[i][COL.TIMESTAMP]) !== targetDate) continue;
+      try {
+        var comment = sanitizeComment_(generateAiCommentWithContext_(buildStudentInput_(block.rows[i], ''), lessonContext));
+        if (!comment) continue;
+        sheet.getRange(block.start + i, colNo_(COL.AI_COACH)).setValue(safeCell_(comment));
+        changed.push(block.rows[i]);
+        count++;
+      } catch (e) {}
+    }
+  } finally {
+    invalidateRowsCache_(changed);
   }
   return count + ' 件の再評価が完了しました。';
 }
@@ -1948,6 +2302,9 @@ function processPendingComments_(force) {
       }
     });
 
+    // 【高速化】書き込んだ生徒の記録・広場のキャッシュを消す
+    invalidateRowsCache_(cases.map(function(c) { return data[c.i]; }));
+
     // ⑥ 待機中の行がなくなったら「待機あり」の印を消す
     var remaining = totalPending - done - failed;
     if (remaining <= 0) clearPendingFlag_(props, startedAt);
@@ -2043,10 +2400,11 @@ function getTeacherReviewQueue(targetDate, classNo) {
   if (targetClass && CLASS_LIST.indexOf(targetClass) === -1) throw new Error('クラスを選択してください。');
 
   var ss = getSpreadsheet_();
-  var data = getAnswerData_();
+  // 【高速化】日付を指定したときは、その日の行だけを読む
+  var data = targetDate ? readDateBlock_(targetDate).rows : getAnswerData_().slice(1);
   var reviews = loadTeacherReviews_(ss);
   var out = [];
-  for (var i = 1; i < data.length; i++) {
+  for (var i = 0; i < data.length; i++) {
     var row = data[i];
     if (!row[COL.TIMESTAMP] || !row[COL.EMAIL]) continue;
     var dateKey = toDateKey_(row[COL.TIMESTAMP]);
@@ -2068,6 +2426,34 @@ function getTeacherReviewQueue(targetDate, classNo) {
   // Array.prototype.sort は安定ソートなので、同じグループ内は提出順のまま
   out.sort(function(a, b) { return Number(a.review.stamped) - Number(b.review.stamped); });
   return out;
+}
+
+/**
+ * 提出IDから回答シートの行を探す
+ * 【高速化】提出IDに含まれる日時から、その日の行だけを読んで探す（見つからなければ全体を探す）
+ */
+function findReviewRow_(recordId) {
+  var dateKey = '';
+  try {
+    var parsed = JSON.parse(recordId);
+    var d = new Date(parsed[0]);
+    if (!isNaN(d.getTime())) dateKey = toDateKey_(d);
+  } catch (e) {}
+  var candidates = [];
+  if (dateKey) {
+    var block = readDateBlock_(dateKey);
+    block.rows.forEach(function(r, i) { candidates.push({ rowNo: block.start + i, row: r }); });
+  }
+  var matches = candidates.filter(function(c) { return reviewRecordId_(c.row) === recordId; });
+  if (matches.length === 0) {
+    var all = getAnswerData_();
+    for (var i = 1; i < all.length; i++) {
+      if (reviewRecordId_(all[i]) === recordId) matches.push({ rowNo: i + 1, row: all[i] });
+    }
+  }
+  if (matches.length === 0) throw new Error('提出が見つかりません。一覧を読み直してください。');
+  if (matches.length > 1) throw new Error('提出を一意に特定できません。一覧を読み直してください。');
+  return matches[0];
 }
 
 /** ブラウザーから届いた下線の範囲を検証して、必要な項目だけに整える */
@@ -2109,17 +2495,10 @@ function saveTeacherReview(recordId, snapshot, highlights, stamp, expectedRevisi
   lock.waitLock(10000);
   try {
     var ss = getSpreadsheet_();
-    var answerSheet = ss.getSheetByName(SHEET_ANSWERS);
-    var data = answerSheet.getDataRange().getValues();
-
-    var rowIndex = -1;
-    for (var i = 1; i < data.length; i++) {
-      if (reviewRecordId_(data[i]) !== recordId) continue;
-      if (rowIndex !== -1) throw new Error('提出を一意に特定できません。一覧を読み直してください。');
-      rowIndex = i;
-    }
-    if (rowIndex === -1) throw new Error('提出が見つかりません。一覧を読み直してください。');
-    var row = data[rowIndex];
+    var answerSheet = getAnswerSheet_();
+    var found = findReviewRow_(recordId);
+    var rowNo = found.rowNo;          // 回答シートの行番号（1始まり）
+    var row = found.row;
 
     var text = reviewText_(row);
     if (JSON.stringify(text) !== snapshot) throw new Error('回答が変更されています。一覧を読み直してください。');
@@ -2160,11 +2539,13 @@ function saveTeacherReview(recordId, snapshot, highlights, stamp, expectedRevisi
 
     if (updateComment) {
       // リッチテキストとして保存し、先頭が「=」でも数式として実行しない
-      var cell = answerSheet.getRange(rowIndex + 1, colNo_(COL.TEACHER_COMMENT));
+      var cell = answerSheet.getRange(rowNo, colNo_(COL.TEACHER_COMMENT));
       if (teacherComment) cell.setRichTextValue(SpreadsheetApp.newRichTextValue().setText(teacherComment).build());
       else cell.clearContent();
     }
     SpreadsheetApp.flush();
+    // 【高速化】この生徒の記録・広場のキャッシュを消す
+    invalidateRowsCache_([row]);
 
     var one = Object.create(null);
     one[recordId] = { data: saved };
